@@ -36,6 +36,7 @@
   <ItemGroup>
     <ClInclude Include="private.h" />
     <ClInclude Include="VirtIOWdf.h" />
+    <ClInclude Include="..\..\rdmapool\rdmapool_interface.h" />
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <ProjectGuid>{EC1B7990-EA6A-45FE-836C-2F050F6BB632}</ProjectGuid>
@@ -123,7 +124,7 @@
   <ItemDefinitionGroup>
     <ClCompile>
       <AdditionalOptions>/kernel %(AdditionalOptions)</AdditionalOptions>
-      <AdditionalIncludeDirectories>$(ProjectDir)\..;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)\..;$(ProjectDir)\..\..\rdmapool;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <WarningLevel>Level3</WarningLevel>
       <PreprocessorDefinitions Condition="'$(Platform)'=='Win32'">POOL_NX_OPTIN_AUTO=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <PreprocessorDefinitions Condition="'$(Platform)'=='x64'">POOL_NX_OPTIN_AUTO=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>

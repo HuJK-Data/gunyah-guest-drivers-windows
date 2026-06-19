@@ -1,0 +1,65 @@
+;
+; rdmapool.inf - Restricted DMA Pool Driver
+;
+; Matches ACPI device RDMA0000 which describes the restricted DMA pool
+; memory region for protected VM environments.
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %ManufacturerName%
+CatalogFile = rdmapool.cat
+DriverVer   =
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+rdmapool.sys = 1,,
+
+;*****************************************
+; Install Section
+;*****************************************
+
+[Manufacturer]
+%ManufacturerName% = Standard,NT$ARCH$.10.0...16299
+
+[Standard.NT$ARCH$.10.0...16299]
+%rdmapool.DeviceDesc% = rdmapool_Device, ACPI\RDMA0000
+
+[rdmapool_Device.NT]
+CopyFiles = File_Copy
+
+[File_Copy]
+rdmapool.sys
+
+;-------------- Service installation
+[rdmapool_Device.NT.Services]
+AddService = rdmapool,%SPSVCINST_ASSOCSERVICE%, rdmapool_Service_Inst
+
+[rdmapool_Service_Inst]
+DisplayName    = %rdmapool.SVCDESC%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 0               ; SERVICE_BOOT_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\rdmapool.sys
+LoadOrderGroup = System Bus Extender
+
+[rdmapool_Device.NT.Wdf]
+KmdfService = rdmapool, rdmapool_wdfsect
+
+[rdmapool_wdfsect]
+KmdfLibraryVersion = $KMDFVERSION$
+
+[Strings]
+SPSVCINST_ASSOCSERVICE = 0x00000002
+ManufacturerName = "Red Hat, Inc."
+DiskName = "Restricted DMA Pool Driver Installation Disk"
+rdmapool.DeviceDesc = "Restricted DMA Pool Manager"
+rdmapool.SVCDESC = "Restricted DMA Pool Service"

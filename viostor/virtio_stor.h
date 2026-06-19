@@ -40,6 +40,7 @@
 #include "virtio.h"
 #include "virtio_ring.h"
 #include "virtio_stor_utils.h"
+#include "viostor_bounce.h"
 
 typedef struct VirtIOBufferDescriptor VIO_SG, *PVIO_SG;
 
@@ -261,6 +262,16 @@ typedef struct _ADAPTER_EXTENSION
     REQUEST_LIST processing_srbs[MAX_CPU];
     ULONG reset_in_progress_count;
     ULONGLONG fw_ver;
+
+    /* Restricted DMA pool support */
+    BOOLEAN rdmaPoolActive;
+    PVOID rdmaPoolBaseVA;
+    PHYSICAL_ADDRESS rdmaPoolBasePA;
+    ULONG64 rdmaPoolSize;
+    PDEVICE_OBJECT rdmaPoolDeviceObject;
+    PFILE_OBJECT rdmaPoolFileObject;
+    BOUNCE_ALLOCATOR bounce;
+
 #ifdef DBG
     LONG srb_cnt;
     LONG inqueue_cnt;
@@ -286,6 +297,10 @@ typedef struct _SRB_EXTENSION
     VIO_SG sg[VIRTIO_MAX_SG];
     VRING_DESC_ALIAS desc[VIRTIO_MAX_SG];
     blk_discard_write_zeroes blk_discard[MAX_DISCARD_SEGMENTS];
+    /* Bounce buffer tracking (rdmapool) */
+    PVOID bounceCtl;              /* Control slot VA in rdmapool, NULL if not bouncing */
+    PVOID originalDataVA;         /* Original data buffer VA for read copy-back */
+    ULONG bounceDataPageCount;    /* Number of data pages allocated from bounce pool */
 } SRB_EXTENSION, *PSRB_EXTENSION;
 
 BOOLEAN

@@ -1,4 +1,4 @@
-/*
+﻿/*
  * This file contains viostor StorPort(ScsiPort) miniport driver
  *
  * Copyright (c) 2008-2017 Red Hat, Inc.
@@ -527,6 +527,9 @@ VirtIoFindAdapter(IN PVOID DeviceExtension,
                  " Pool area at %p, size = %d\n",
                  adaptExt->poolAllocationVa,
                  adaptExt->poolAllocationSize);
+
+    VioStorConnectRdmaPool(adaptExt);
+
     RhelDbgPrint(TRACE_LEVEL_INFORMATION, " pmsg_affinity = %p\n", adaptExt->pmsg_affinity);
     if (!adaptExt->dump_mode && (adaptExt->num_queues > 1) && (adaptExt->pmsg_affinity == NULL))
     {
@@ -730,6 +733,31 @@ VirtIoHwInitialize(IN PVOID DeviceExtension)
         return ret;
     }
 
+    /* Initialize bounce buffer allocator from remaining rdmapool space */
+    if (adaptExt->rdmaPoolActive)
+    {
+        PUCHAR bounceBase = (PUCHAR)adaptExt->pageAllocationVa + adaptExt->pageOffset;
+        SIZE_T bounceSize;
+        PHYSICAL_ADDRESS bouncePA;
+        NTSTATUS status;
+
+        bounceSize = adaptExt->pageAllocationSize - adaptExt->pageOffset;
+        bouncePA.QuadPart = adaptExt->rdmaPoolBasePA.QuadPart + adaptExt->pageOffset;
+
+        RhelDbgPrint(TRACE_LEVEL_INFORMATION,
+            " Bounce region: VA=%p PA=0x%I64x Size=0x%Ix (after ring offset 0x%x)\n",
+            bounceBase, bouncePA.QuadPart, bounceSize, adaptExt->pageOffset);
+
+        status = BounceInit(&adaptExt->bounce, bounceBase, bouncePA,
+                            bounceSize, adaptExt->queue_depth);
+        if (!NT_SUCCESS(status))
+        {
+            RhelDbgPrint(TRACE_LEVEL_ERROR,
+                " BounceInit failed 0x%x, disabling rdmapool bounce\n", status);
+            adaptExt->rdmaPoolActive = FALSE;
+        }
+    }
+
     memset(&adaptExt->inquiry_data, 0, sizeof(INQUIRYDATA));
 
     adaptExt->inquiry_data.ANSIVersion = 4;
@@ -877,6 +905,11 @@ static VOID CompletePendingRequestsOnReset(IN PVOID DeviceExtension)
                 PSCSI_REQUEST_BLOCK Srb = (PSCSI_REQUEST_BLOCK)req->req;
                 if (Srb)
                 {
+                    PSRB_EXTENSION srbExt = SRB_EXTENSION((PSRB_TYPE)Srb);
+                    if (srbExt)
+                    {
+                        BOUNCE_CLEANUP_SRB(adaptExt, srbExt);
+                    }
                     SRB_SET_DATA_TRANSFER_LENGTH(Srb, 0);
                     CompleteRequestWithStatus(DeviceExtension, (PSRB_TYPE)Srb, SRB_STATUS_BUS_RESET);
                     element->srb_cnt--;
@@ -1382,6 +1415,7 @@ VirtIoAdapterControl(IN PVOID DeviceExtension, IN SCSI_ADAPTER_CONTROL_TYPE Cont
                 }
                 if (adaptExt->stopped)
                 {
+                    VioStorDisconnectRdmaPool(adaptExt);
                     if (adaptExt->pmsg_affinity != NULL)
                     {
                         StorPortFreePool(DeviceExtension, (PVOID)adaptExt->pmsg_affinity);
@@ -1618,11 +1652,111 @@ VirtIoBuildIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
         srbExt->in = sgElement;
     }
 
-    srbExt->sg[0].physAddr = StorPortGetPhysicalAddress(DeviceExtension, NULL, &srbExt->vbr.out_hdr, &dummy);
-    srbExt->sg[0].length = sizeof(srbExt->vbr.out_hdr);
+    /* Bounce buffer setup for restricted DMA pool */
+    if (adaptExt->rdmaPoolActive && adaptExt->bounce.Initialized)
+    {
+        PVOID ctlSlot;
+        PVOID dataVA = NULL;
+        BOOLEAN isWrite = !!(SRB_FLAGS(Srb) & SRB_FLAGS_DATA_OUT);
+        ULONG dataPageCount = 0;
+        SIZE_T dataOffset = 0;
+        ULONG totalDataLen = SRB_DATA_TRANSFER_LENGTH(Srb);
+        ULONG newSgIdx = 1;
+        ULONG j;
 
-    srbExt->sg[sgElement].physAddr = StorPortGetPhysicalAddress(DeviceExtension, NULL, &srbExt->vbr.status, &dummy);
-    srbExt->sg[sgElement].length = sizeof(srbExt->vbr.status);
+        ctlSlot = BounceAllocCtl(&adaptExt->bounce);
+        if (!ctlSlot)
+        {
+            RhelDbgPrint(TRACE_LEVEL_ERROR, " Bounce: no control slots available\n");
+            CompleteRequestWithStatus(DeviceExtension, (PSRB_TYPE)Srb, SRB_STATUS_BUSY);
+            return FALSE;
+        }
+        srbExt->bounceCtl = ctlSlot;
+
+        /* Copy out_hdr to bounce control slot */
+        RtlCopyMemory((PUCHAR)ctlSlot + BOUNCE_CTL_OUTHDR_OFFSET,
+                       &srbExt->vbr.out_hdr, sizeof(srbExt->vbr.out_hdr));
+
+        /* Header SG → bounce */
+        srbExt->sg[0].physAddr = BounceVAtoPA(&adaptExt->bounce,
+                                              (PUCHAR)ctlSlot + BOUNCE_CTL_OUTHDR_OFFSET);
+        srbExt->sg[0].length = sizeof(srbExt->vbr.out_hdr);
+
+        /* Get system VA for data buffer copy */
+        if (totalDataLen > 0)
+        {
+            ULONG sysAddrStatus = StorPortGetSystemAddress(DeviceExtension, Srb, &dataVA);
+            if (sysAddrStatus != STOR_STATUS_SUCCESS || dataVA == NULL)
+            {
+                BounceFreeCtl(&adaptExt->bounce, ctlSlot);
+                srbExt->bounceCtl = NULL;
+                RhelDbgPrint(TRACE_LEVEL_ERROR, " Bounce: StorPortGetSystemAddress failed 0x%x\n", sysAddrStatus);
+                CompleteRequestWithStatus(DeviceExtension, (PSRB_TYPE)Srb, SRB_STATUS_ERROR);
+                return FALSE;
+            }
+        }
+        srbExt->originalDataVA = dataVA;
+
+        /* Allocate bounce pages for data, splitting into PAGE_SIZE chunks */
+        for (dataOffset = 0; dataOffset < totalDataLen; )
+        {
+            PVOID bouncePage = BounceAllocDataPage(&adaptExt->bounce);
+            ULONG chunkLen;
+
+            if (!bouncePage)
+            {
+                /* Free previously allocated data pages */
+                for (j = 1; j <= dataPageCount; j++)
+                {
+                    BounceFreeDataPage(&adaptExt->bounce,
+                        BouncePAtoVA(&adaptExt->bounce, srbExt->sg[j].physAddr));
+                }
+                BounceFreeCtl(&adaptExt->bounce, ctlSlot);
+                srbExt->bounceCtl = NULL;
+                RhelDbgPrint(TRACE_LEVEL_ERROR, " Bounce: no data pages\n");
+                CompleteRequestWithStatus(DeviceExtension, (PSRB_TYPE)Srb, SRB_STATUS_BUSY);
+                return FALSE;
+            }
+            dataPageCount++;
+            chunkLen = min(PAGE_SIZE, totalDataLen - (ULONG)dataOffset);
+
+            if (isWrite && dataVA)
+            {
+                RtlCopyMemory(bouncePage, (PUCHAR)dataVA + dataOffset, chunkLen);
+            }
+
+            srbExt->sg[newSgIdx].physAddr = BounceVAtoPA(&adaptExt->bounce, bouncePage);
+            srbExt->sg[newSgIdx].length = chunkLen;
+            newSgIdx++;
+            dataOffset += chunkLen;
+        }
+        srbExt->bounceDataPageCount = dataPageCount;
+
+        /* Status SG → bounce */
+        srbExt->sg[newSgIdx].physAddr = BounceVAtoPA(&adaptExt->bounce,
+                                                     (PUCHAR)ctlSlot + BOUNCE_CTL_STATUS_OFFSET);
+        srbExt->sg[newSgIdx].length = sizeof(srbExt->vbr.status);
+
+        /* Update out/in counts to reflect bounce layout */
+        if (isWrite)
+        {
+            srbExt->out = newSgIdx;  /* hdr + data pages */
+            srbExt->in = 1;          /* status */
+        }
+        else
+        {
+            srbExt->out = 1;         /* hdr */
+            srbExt->in = newSgIdx;   /* data pages + status */
+        }
+    }
+    else
+    {
+        srbExt->sg[0].physAddr = StorPortGetPhysicalAddress(DeviceExtension, NULL, &srbExt->vbr.out_hdr, &dummy);
+        srbExt->sg[0].length = sizeof(srbExt->vbr.out_hdr);
+
+        srbExt->sg[sgElement].physAddr = StorPortGetPhysicalAddress(DeviceExtension, NULL, &srbExt->vbr.status, &dummy);
+        srbExt->sg[sgElement].length = sizeof(srbExt->vbr.status);
+    }
 
     return TRUE;
 }
@@ -2275,6 +2409,16 @@ VOID VioStorCompleteRequest(IN PVOID DeviceExtension, IN ULONG MessageID, IN BOO
 
             if (bFound && srbExt->vbr.out_hdr.type == VIRTIO_BLK_T_GET_ID)
             {
+                /* Bounce cleanup for GET_ID: copy sn and status from bounce slot */
+                if (srbExt->bounceCtl)
+                {
+                    RtlCopyMemory(adaptExt->sn,
+                                  (PUCHAR)srbExt->bounceCtl + BOUNCE_CTL_SN_OFFSET,
+                                  sizeof(adaptExt->sn));
+                    srbExt->vbr.status = *((u8 *)((PUCHAR)srbExt->bounceCtl + BOUNCE_CTL_STATUS_OFFSET));
+                    BounceFreeCtl(&adaptExt->bounce, srbExt->bounceCtl);
+                    srbExt->bounceCtl = NULL;
+                }
                 adaptExt->sn_ok = TRUE;
                 if (Srb)
                 {
@@ -2317,6 +2461,31 @@ VOID VioStorCompleteRequest(IN PVOID DeviceExtension, IN ULONG MessageID, IN BOO
             }
             if (bFound && Srb)
             {
+                /* Bounce cleanup: copy status and read data back, free bounce buffers */
+                if (srbExt->bounceCtl)
+                {
+                    /* Copy device-written status from bounce */
+                    srbExt->vbr.status = *((u8 *)((PUCHAR)srbExt->bounceCtl + BOUNCE_CTL_STATUS_OFFSET));
+
+                    /* For reads: copy data from bounce pages back to original buffer */
+                    if (srbExt->vbr.out_hdr.type == VIRTIO_BLK_T_IN &&
+                        srbExt->originalDataVA != NULL &&
+                        srbExt->bounceDataPageCount > 0)
+                    {
+                        SIZE_T offset = 0;
+                        ULONG bIdx;
+                        for (bIdx = 1; bIdx <= srbExt->bounceDataPageCount; bIdx++)
+                        {
+                            PVOID srcVA = BouncePAtoVA(&adaptExt->bounce, srbExt->sg[bIdx].physAddr);
+                            RtlCopyMemory((PUCHAR)srbExt->originalDataVA + offset,
+                                          srcVA, srbExt->sg[bIdx].length);
+                            offset += srbExt->sg[bIdx].length;
+                        }
+                    }
+
+                    BOUNCE_CLEANUP_SRB(adaptExt, srbExt);
+                }
+
                 srbStatus = DeviceToSrbStatus(srbExt->vbr.status);
                 RhelDbgPrint(TRACE_LEVEL_INFORMATION,
                              " srb %p, QueueNumber %lu, MessageId %lu.\n",

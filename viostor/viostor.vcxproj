@@ -119,7 +119,7 @@
   </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile>
-      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);..\VirtIO</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);..\VirtIO;..\rdmapool</AdditionalIncludeDirectories>
       <WarningLevel>Level3</WarningLevel>
       <DisableSpecificWarnings>4603;4627;4986;4987;4996;6001;6387;%(DisableSpecificWarnings)</DisableSpecificWarnings>
     </ClCompile>
@@ -225,6 +225,7 @@
     <ClInclude Include="virtio_stor_hw_helper.h" />
     <ClInclude Include="virtio_stor_trace.h" />
     <ClInclude Include="virtio_stor_utils.h" />
+    <ClInclude Include="viostor_bounce.h" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="virtio_stor.rc" />
@@ -234,6 +235,7 @@
     <ClCompile Include="virtio_stor.c" />
     <ClCompile Include="virtio_stor_hw_helper.c" />
     <ClCompile Include="virtio_stor_utils.c" />
+    <ClCompile Include="viostor_bounce.c" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <Import Project="$(MSBuildProjectDirectory)\..\build\Driver.Common.targets" />

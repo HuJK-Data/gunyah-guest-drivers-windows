@@ -64,6 +64,15 @@ typedef struct virtio_wdf_driver {
 
     BOOLEAN IsIoMmuActive;
 
+    /* Restricted DMA pool support */
+    BOOLEAN RdmaPoolActive;
+    PDEVICE_OBJECT RdmaPoolDeviceObject;
+    PFILE_OBJECT RdmaPoolFileObject;
+    PVOID RdmaPoolBaseVA;
+    PHYSICAL_ADDRESS RdmaPoolBasePA;
+    ULONG64 RdmaPoolSize;
+    LIST_ENTRY RdmaPoolAllocList;   /* List of RDMAPOOL_ALLOC_ENTRY */
+
 } VIRTIO_WDF_DRIVER, *PVIRTIO_WDF_DRIVER;
 
 /* Queue discovery callbacks used by VirtIOWdfInitQueuesCB. */
