@@ -50,6 +50,7 @@ jobs:
             @{ p='NetKVM/CoInstaller/netkvmco-vs2015.vcxproj'; c='Win11 Release'; plat='ARM64' ; dep=$true },
             @{ p='viosock/lib/viosocklib.vcxproj';          c='Win11 Release'; plat='ARM64' ; dep=$true },
             @{ p='viosock/wspsvc/viosockwspsvc.vcxproj';    c='Win11 Release'; plat='ARM64' ; dep=$true },
+            @{ p='NetKVM/ProtocolService/ProtocolService.vcxproj'; c='Win11 Release'; plat='ARM64' ; dep=$true },
             @{ p='viostor/viostor.vcxproj';                 c='Win11 Release'; plat='ARM64' },
             @{ p='vioscsi/vioscsi.vcxproj';                 c='Win11 Release'; plat='ARM64' },
             @{ p='vioserial/sys/vioser.vcxproj';            c='Win11 Release'; plat='ARM64' },
@@ -88,48 +89,45 @@ jobs:
           Export-PfxCertificate -Cert $cert -FilePath $pfx -Password $pw | Out-Null
           Export-Certificate   -Cert $cert -FilePath "out\DroidVM_Test.cer" | Out-Null
 
-          # 各驅動的「官方 package」目錄（build 已 inf2cat 出 cat，只是未簽）
-          $pkgs = [ordered]@{
-            viostor   = 'viostor\Install\Win11\ARM64'
-            vioscsi   = 'vioscsi\Install\Win11\ARM64'
-            vioserial = 'vioserial\Install\Win11\ARM64'
-            viorng    = 'viorng\Install\Win11\ARM64'
-            viosock   = 'viosock\Install\Win11\ARM64'
-            NetKVM    = 'NetKVM\Install\Win11\ARM64'
-            rdmapool  = 'rdmapool\ARM64\Release\rdmapool'
+          # 按 inf 需求，從 build 樹組裝每個 driver package（root, 需要的二進位, 對應 inf）
+          $drv = @(
+            @{ n='viostor';   root='viostor';   bins=@('viostor.sys');  inf='viostor.inf' },
+            @{ n='vioscsi';   root='vioscsi';   bins=@('vioscsi.sys');  inf='vioscsi.inf' },
+            @{ n='vioserial'; root='vioserial'; bins=@('vioser.sys');   inf='vioser.inf' },
+            @{ n='viorng';    root='viorng';    bins=@('viorng.sys');   inf='viorng.inf' },
+            @{ n='viosock';   root='viosock';   bins=@('viosock.sys','viosocklib.dll','viosockwspsvc.exe'); inf='viosock.inf' },
+            @{ n='NetKVM';    root='NetKVM';    bins=@('netkvm.sys','netkvmp.exe'); inf='netkvm.inf' },
+            @{ n='rdmapool';  root='rdmapool';  bins=@('rdmapool.sys'); inf='rdmapool.inf' }
+          )
+          # 在 root 下找最佳檔案：優先路徑含 ARM64、最新修改
+          function Pick($root,$file) {
+            Get-ChildItem $root -Recurse -Filter $file -File -EA SilentlyContinue |
+              Where-Object { $_.FullName -match 'ARM64|arm64' } |
+              Sort-Object LastWriteTime -Desc | Select-Object -First 1
           }
-          function Find-Pkg($hint) {
-            if ((Test-Path $hint) -and (Get-ChildItem $hint -Filter *.sys -EA SilentlyContinue) -and (Get-ChildItem $hint -Filter *.inf -EA SilentlyContinue)) {
-              return (Resolve-Path $hint).Path
+          foreach ($d in $drv) {
+            $dest = "out\drivers\$($d.n)"; New-Item -ItemType Directory -Force $dest | Out-Null
+            $ok = $true
+            foreach ($b in $d.bins) {
+              $f = Pick $d.root $b
+              if ($f) { Copy-Item $f.FullName $dest -Force } else { Write-Host "::warning::$($d.n): 缺 $b"; $ok=$false }
             }
-            $root = ($hint -split '\\')[0]
-            $cand = Get-ChildItem $root -Recurse -Directory -EA SilentlyContinue | Where-Object {
-              $_.FullName -match 'ARM64' -and
-              (Get-ChildItem $_.FullName -Filter *.inf -EA SilentlyContinue) -and
-              (Get-ChildItem $_.FullName -Filter *.sys -EA SilentlyContinue) }
-            $withcat = $cand | Where-Object { Get-ChildItem $_.FullName -Filter *.cat -EA SilentlyContinue } | Select -First 1
-            if ($withcat) { return $withcat.FullName }
-            if ($cand)    { return ($cand | Select -First 1).FullName }
-            return $null
-          }
-          foreach ($name in $pkgs.Keys) {
-            $src = Find-Pkg $pkgs[$name]
-            if (-not $src) { Write-Host "::warning::no package for $name"; continue }
-            $dest = "out\drivers\$name"; New-Item -ItemType Directory -Force $dest | Out-Null
-            Copy-Item "$src\*" $dest -Recurse -Force -EA SilentlyContinue
-            # 簽所有 PE（內嵌 sig 不改 Authenticode hash -> 既有 cat 仍有效）
+            # 取已 stamp 的 inf（排除原始 .inx；rdmapool 原始是 .inf，故優先 ARM64 路徑）
+            $infF = Pick $d.root $d.inf
+            if ($infF) { Copy-Item $infF.FullName $dest -Force } else { Write-Host "::warning::$($d.n): 缺 $($d.inf)"; $ok=$false }
+            if (-not $ok) { Write-Host "::warning::$($d.n) 不完整，略過簽署"; continue }
+            # 簽所有 PE
             Get-ChildItem "$dest\*" -Include *.sys,*.dll,*.exe -EA SilentlyContinue |
               ForEach-Object { & $signtool sign /fd SHA256 /f $pfx /p "$env:PFX_PW" $_.FullName }
-            # cat 不存在才補做
-            if (-not (Get-ChildItem "$dest\*.cat" -EA SilentlyContinue)) {
-              & $inf2cat /driver:$dest /os:$env:OSMASK
-            }
+            # 產 cat + 簽
+            & $inf2cat /driver:$dest /os:$env:OSMASK
             Get-ChildItem "$dest\*.cat" -EA SilentlyContinue |
               ForEach-Object { & $signtool sign /fd SHA256 /f $pfx /p "$env:PFX_PW" $_.FullName }
-            Write-Host "packed $name  <- $src"
+            $has = (Get-ChildItem "$dest" | ForEach-Object Name) -join ' '
+            Write-Host "packed $($d.n): $has"
           }
           Remove-Item $pfx -Force   # 不上傳私鑰
-          Write-Host "=== staged ==="; Get-ChildItem -Recurse out | Select FullName
+          Write-Host "=== staged ==="; Get-ChildItem -Recurse out -File | Select FullName
 
       - name: Upload drivers artifact
         uses: actions/upload-artifact@v4
