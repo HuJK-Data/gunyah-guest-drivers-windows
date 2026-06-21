@@ -51,6 +51,7 @@ jobs:
             @{ p='viosock/lib/viosocklib.vcxproj';          c='Win11 Release'; plat='ARM64' ; dep=$true },
             @{ p='viosock/wspsvc/viosockwspsvc.vcxproj';    c='Win11 Release'; plat='ARM64' ; dep=$true },
             @{ p='NetKVM/ProtocolService/ProtocolService.vcxproj'; c='Win11 Release'; plat='ARM64' ; dep=$true },
+            @{ p='viorng/cng/um/viorngum.vcxproj';          c='Win11 Release'; plat='ARM64' ; dep=$true },
             @{ p='viostor/viostor.vcxproj';                 c='Win11 Release'; plat='ARM64' },
             @{ p='vioscsi/vioscsi.vcxproj';                 c='Win11 Release'; plat='ARM64' },
             @{ p='vioserial/sys/vioser.vcxproj';            c='Win11 Release'; plat='ARM64' },
@@ -79,6 +80,7 @@ jobs:
           $kitbin = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\10.*" -Directory | Sort Name -Desc | Select -First 1).FullName
           $signtool = Join-Path $kitbin 'x64\signtool.exe'
           $inf2cat  = Join-Path $kitbin 'x86\inf2cat.exe'
+          $stampinf = Join-Path $kitbin 'x86\stampinf.exe'
 
           New-Item -ItemType Directory -Force out | Out-Null
           $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "$env:CERT_SUBJECT" `
@@ -94,7 +96,7 @@ jobs:
             @{ n='viostor';   root='viostor';   bins=@('viostor.sys');  inf='viostor.inf' },
             @{ n='vioscsi';   root='vioscsi';   bins=@('vioscsi.sys');  inf='vioscsi.inf' },
             @{ n='vioserial'; root='vioserial'; bins=@('vioser.sys');   inf='vioser.inf' },
-            @{ n='viorng';    root='viorng';    bins=@('viorng.sys');   inf='viorng.inf' },
+            @{ n='viorng';    root='viorng';    bins=@('viorng.sys','viorngum.dll'); inf='viorng.inf' },
             @{ n='viosock';   root='viosock';   bins=@('viosock.sys','viosocklib.dll','viosockwspsvc.exe'); inf='viosock.inf' },
             @{ n='NetKVM';    root='NetKVM';    bins=@('netkvm.sys','netkvmp.exe'); inf='netkvm.inf' },
             @{ n='rdmapool';  root='rdmapool';  bins=@('rdmapool.sys'); inf='rdmapool.inf' }
@@ -105,6 +107,13 @@ jobs:
               Where-Object { $_.FullName -match 'ARM64|arm64' } |
               Sort-Object LastWriteTime -Desc | Select-Object -First 1
           }
+          # inf：優先 ARM64 路徑（已 stamp），否則退回任何（含 source 模板，後面用 stampinf 處理）
+          function PickInf($root,$file) {
+            $f = Pick $root $file
+            if ($f) { return $f }
+            Get-ChildItem $root -Recurse -Filter $file -File -EA SilentlyContinue |
+              Sort-Object LastWriteTime -Desc | Select-Object -First 1
+          }
           foreach ($d in $drv) {
             $dest = "out\drivers\$($d.n)"; New-Item -ItemType Directory -Force $dest | Out-Null
             $ok = $true
@@ -112,10 +121,16 @@ jobs:
               $f = Pick $d.root $b
               if ($f) { Copy-Item $f.FullName $dest -Force } else { Write-Host "::warning::$($d.n): 缺 $b"; $ok=$false }
             }
-            # 取已 stamp 的 inf（排除原始 .inx；rdmapool 原始是 .inf，故優先 ARM64 路徑）
-            $infF = Pick $d.root $d.inf
+            # 取 inf（優先 ARM64 已 stamp；否則 source 模板）
+            $infF = PickInf $d.root $d.inf
             if ($infF) { Copy-Item $infF.FullName $dest -Force } else { Write-Host "::warning::$($d.n): 缺 $($d.inf)"; $ok=$false }
             if (-not $ok) { Write-Host "::warning::$($d.n) 不完整，略過簽署"; continue }
+            # 若 inf 仍有未替換的 stampinf token，補做 stampinf（$ARCH$ -> ARM64, $KMDFVERSION$ -> 1.15）
+            $infPath = Join-Path $dest $d.inf
+            if ((Get-Content $infPath -Raw) -match '\$ARCH\$|\$KMDFVERSION\$') {
+              & $stampinf -f $infPath -a ARM64 -k 1.15 -d "*" -v "*"
+              Write-Host "stampinf -> $($d.n)"
+            }
             # 簽所有 PE
             Get-ChildItem "$dest\*" -Include *.sys,*.dll,*.exe -EA SilentlyContinue |
               ForEach-Object { & $signtool sign /fd SHA256 /f $pfx /p "$env:PFX_PW" $_.FullName }
