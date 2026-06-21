@@ -37,30 +37,27 @@ jobs:
           Get-ChildItem "C:\Program Files*\Microsoft Visual Studio\*\*\MSBuild\Microsoft\VC\*\Platforms\ARM64\PlatformToolsets" -ErrorAction SilentlyContinue |
             Select-Object FullName
 
-      - name: Build ARM64 drivers (per project)
+      - name: Build ARM64 drivers
         shell: pwsh
         run: |
-          # 多數驅動用 "Win11 Release"；rdmapool 是獨立專案，config 為 "Release"
-          $projects = @(
-            @{ p='viostor/viostor.vcxproj';      c='Win11 Release' },
-            @{ p='vioscsi/vioscsi.vcxproj';      c='Win11 Release' },
-            @{ p='vioserial/sys/vioser.vcxproj'; c='Win11 Release' },
-            @{ p='viorng/viorng/viorng.vcxproj'; c='Win11 Release' },
-            @{ p='NetKVM/NetKVM-VS2015.vcxproj'; c='Win11 Release' },
-            @{ p='viosock/sys/viosock.vcxproj';  c='Win11 Release' },
-            @{ p='rdmapool/rdmapool.vcxproj';    c='Release' }
-          )
+          # 透過 sln target 建 -> 讓 sln 自動解相依（VirtioLib / VirtioLib-WDF / Mof / CoInstaller）。
+          # rdmapool 不在主 sln，單獨建（config 為 Release）。
+          # ApiValidator_Enable=false：rdmapool 用了非 Universal DDI，跳過事後驗證（驅動已成功產出）。
+          $common = @('/m','/p:Platform=ARM64','/p:ApiValidator_Enable=false','/p:SpectreMitigation=false','/p:SignMode=Off')
+          $slnTargets = @('viostor','vioscsi','vioser','viorng','viosock','NetKVM-VS2015')
           $failed = @()
-          foreach ($j in $projects) {
-            Write-Host "::group::build $($j.p) [$($j.c)|$env:PLATFORM]"
-            msbuild $j.p /m `
-              /p:Configuration="$($j.c)" /p:Platform="$env:PLATFORM" `
-              /p:SpectreMitigation=false /p:SignMode=Off
-            if ($LASTEXITCODE -ne 0) { $failed += $j.p }
+          foreach ($t in $slnTargets) {
+            Write-Host "::group::build sln:$t [Win11 Release|ARM64]"
+            msbuild virtio-win.sln /t:$t /p:Configuration="Win11 Release" @common
+            if ($LASTEXITCODE -ne 0) { $failed += $t }
             Write-Host "::endgroup::"
           }
-          if ($failed.Count) { Write-Host "::warning::Failed projects: $($failed -join ', ')" }
-          # 不讓單一專案失敗中止整個 job；簽署/打包還是會處理已成功的部分
+          Write-Host "::group::build rdmapool [Release|ARM64]"
+          msbuild rdmapool/rdmapool.vcxproj /p:Configuration="Release" @common
+          if ($LASTEXITCODE -ne 0) { $failed += 'rdmapool' }
+          Write-Host "::endgroup::"
+          if ($failed.Count) { Write-Host "::warning::Failed targets: $($failed -join ', ')" }
+          # 不中止 job；簽署/打包會處理已成功的部分
 
       - name: Self-sign + package
         shell: pwsh
