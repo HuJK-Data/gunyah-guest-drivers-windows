@@ -110,11 +110,15 @@ jobs:
               Where-Object { $_.FullName -match 'ARM64|arm64' } |
               Sort-Object LastWriteTime -Desc | Select-Object -First 1
           }
-          # inf：優先 ARM64 路徑（已 stamp），否則退回任何（含 source 模板，後面用 stampinf 處理）
+          # inf：優先 ARM64 已 stamp -> 任何 .inf -> source .inx（後面 stampinf 補 token）
           function PickInf($root,$file) {
             $f = Pick $root $file
             if ($f) { return $f }
-            Get-ChildItem $root -Recurse -Filter $file -File -EA SilentlyContinue |
+            $f = Get-ChildItem $root -Recurse -Filter $file -File -EA SilentlyContinue |
+              Sort-Object LastWriteTime -Desc | Select-Object -First 1
+            if ($f) { return $f }
+            $inx = [IO.Path]::ChangeExtension($file,'.inx')
+            Get-ChildItem $root -Recurse -Filter $inx -File -EA SilentlyContinue |
               Sort-Object LastWriteTime -Desc | Select-Object -First 1
           }
           foreach ($d in $drv) {
@@ -126,7 +130,7 @@ jobs:
             }
             # 取 inf（優先 ARM64 已 stamp；否則 source 模板）
             $infF = PickInf $d.root $d.inf
-            if ($infF) { Copy-Item $infF.FullName $dest -Force } else { Write-Host "::warning::$($d.n): 缺 $($d.inf)"; $ok=$false }
+            if ($infF) { Copy-Item $infF.FullName (Join-Path $dest $d.inf) -Force } else { Write-Host "::warning::$($d.n): 缺 $($d.inf)"; $ok=$false }
             if (-not $ok) { Write-Host "::warning::$($d.n) 不完整，略過簽署"; continue }
             # 若 inf 仍有未替換的 stampinf token，補做 stampinf（$ARCH$ -> ARM64, $KMDFVERSION$ -> 1.15）
             $infPath = Join-Path $dest $d.inf
