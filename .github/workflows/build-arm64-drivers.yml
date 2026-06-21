@@ -48,6 +48,8 @@ jobs:
             @{ p='VirtIO/VirtioLib.vcxproj';                c='Win11 Release'; plat='ARM64' ; dep=$true },
             @{ p='VirtIO/WDF/VirtioLib-WDF.vcxproj';        c='Win11 Release'; plat='ARM64' ; dep=$true },
             @{ p='NetKVM/CoInstaller/netkvmco-vs2015.vcxproj'; c='Win11 Release'; plat='ARM64' ; dep=$true },
+            @{ p='viosock/lib/viosocklib.vcxproj';          c='Win11 Release'; plat='ARM64' ; dep=$true },
+            @{ p='viosock/wspsvc/viosockwspsvc.vcxproj';    c='Win11 Release'; plat='ARM64' ; dep=$true },
             @{ p='viostor/viostor.vcxproj';                 c='Win11 Release'; plat='ARM64' },
             @{ p='vioscsi/vioscsi.vcxproj';                 c='Win11 Release'; plat='ARM64' },
             @{ p='vioserial/sys/vioser.vcxproj';            c='Win11 Release'; plat='ARM64' },
@@ -69,14 +71,13 @@ jobs:
           if ($failed.Count) { Write-Host "::warning::Failed: $($failed -join ', ')" }
           # 不中止 job；簽署/打包會處理已成功的部分
 
-      - name: Self-sign + package
+      - name: Sign + package
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
-          $kit = "C:\Program Files (x86)\Windows Kits\10\bin"
-          $signtool = (Get-ChildItem "$kit\*\x64\signtool.exe"  | Sort FullName -Desc | Select -First 1).FullName
-          $inf2cat  = (Get-ChildItem "$kit\*\x86\inf2cat.exe"   | Sort FullName -Desc | Select -First 1).FullName
-          Write-Host "signtool=$signtool"; Write-Host "inf2cat=$inf2cat"
+          $kitbin = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\10.*" -Directory | Sort Name -Desc | Select -First 1).FullName
+          $signtool = Join-Path $kitbin 'x64\signtool.exe'
+          $inf2cat  = Join-Path $kitbin 'x86\inf2cat.exe'
 
           New-Item -ItemType Directory -Force out | Out-Null
           $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "$env:CERT_SUBJECT" `
@@ -87,26 +88,45 @@ jobs:
           Export-PfxCertificate -Cert $cert -FilePath $pfx -Password $pw | Out-Null
           Export-Certificate   -Cert $cert -FilePath "out\DroidVM_Test.cer" | Out-Null
 
-          $roots = 'viostor','vioscsi','vioserial','viorng','NetKVM','viosock','rdmapool'
-          foreach ($r in $roots) {
-            $dir = Get-ChildItem -Path $r -Recurse -Directory -ErrorAction SilentlyContinue |
-              Where-Object {
-                $_.FullName -match 'ARM64' -and
-                (Get-ChildItem $_.FullName -Filter *.inf -ErrorAction SilentlyContinue) -and
-                (Get-ChildItem $_.FullName -Filter *.sys -ErrorAction SilentlyContinue)
-              } | Select-Object -First 1
-            if (-not $dir) { Write-Host "::warning::no ARM64 output for $r"; continue }
-            $dest = "out\drivers\$r"; New-Item -ItemType Directory -Force $dest | Out-Null
-            Copy-Item "$($dir.FullName)\*.inf" $dest -ErrorAction SilentlyContinue
-            Copy-Item "$($dir.FullName)\*.sys" $dest -ErrorAction SilentlyContinue
-            Copy-Item "$($dir.FullName)\*.dll" $dest -ErrorAction SilentlyContinue
-            # 內嵌簽 .sys（boot driver winload 會檢查）
-            Get-ChildItem "$dest\*.sys" | ForEach-Object { & $signtool sign /fd SHA256 /f $pfx /p "$env:PFX_PW" $_.FullName }
-            # 重建 .cat（簽過 sys 後雜湊改變）並簽
-            Remove-Item "$dest\*.cat" -ErrorAction SilentlyContinue
-            & $inf2cat /driver:$dest /os:$env:OSMASK
-            Get-ChildItem "$dest\*.cat" | ForEach-Object { & $signtool sign /fd SHA256 /f $pfx /p "$env:PFX_PW" $_.FullName }
-            Write-Host "packed $r"
+          # 各驅動的「官方 package」目錄（build 已 inf2cat 出 cat，只是未簽）
+          $pkgs = [ordered]@{
+            viostor   = 'viostor\Install\Win11\ARM64'
+            vioscsi   = 'vioscsi\Install\Win11\ARM64'
+            vioserial = 'vioserial\Install\Win11\ARM64'
+            viorng    = 'viorng\Install\Win11\ARM64'
+            viosock   = 'viosock\Install\Win11\ARM64'
+            NetKVM    = 'NetKVM\Install\Win11\ARM64'
+            rdmapool  = 'rdmapool\ARM64\Release\rdmapool'
+          }
+          function Find-Pkg($hint) {
+            if ((Test-Path $hint) -and (Get-ChildItem $hint -Filter *.sys -EA SilentlyContinue) -and (Get-ChildItem $hint -Filter *.inf -EA SilentlyContinue)) {
+              return (Resolve-Path $hint).Path
+            }
+            $root = ($hint -split '\\')[0]
+            $cand = Get-ChildItem $root -Recurse -Directory -EA SilentlyContinue | Where-Object {
+              $_.FullName -match 'ARM64' -and
+              (Get-ChildItem $_.FullName -Filter *.inf -EA SilentlyContinue) -and
+              (Get-ChildItem $_.FullName -Filter *.sys -EA SilentlyContinue) }
+            $withcat = $cand | Where-Object { Get-ChildItem $_.FullName -Filter *.cat -EA SilentlyContinue } | Select -First 1
+            if ($withcat) { return $withcat.FullName }
+            if ($cand)    { return ($cand | Select -First 1).FullName }
+            return $null
+          }
+          foreach ($name in $pkgs.Keys) {
+            $src = Find-Pkg $pkgs[$name]
+            if (-not $src) { Write-Host "::warning::no package for $name"; continue }
+            $dest = "out\drivers\$name"; New-Item -ItemType Directory -Force $dest | Out-Null
+            Copy-Item "$src\*" $dest -Recurse -Force -EA SilentlyContinue
+            # 簽所有 PE（內嵌 sig 不改 Authenticode hash -> 既有 cat 仍有效）
+            Get-ChildItem "$dest\*" -Include *.sys,*.dll,*.exe -EA SilentlyContinue |
+              ForEach-Object { & $signtool sign /fd SHA256 /f $pfx /p "$env:PFX_PW" $_.FullName }
+            # cat 不存在才補做
+            if (-not (Get-ChildItem "$dest\*.cat" -EA SilentlyContinue)) {
+              & $inf2cat /driver:$dest /os:$env:OSMASK
+            }
+            Get-ChildItem "$dest\*.cat" -EA SilentlyContinue |
+              ForEach-Object { & $signtool sign /fd SHA256 /f $pfx /p "$env:PFX_PW" $_.FullName }
+            Write-Host "packed $name  <- $src"
           }
           Remove-Item $pfx -Force   # 不上傳私鑰
           Write-Host "=== staged ==="; Get-ChildItem -Recurse out | Select FullName
