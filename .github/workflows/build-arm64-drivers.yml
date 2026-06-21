@@ -1,0 +1,111 @@
+name: Build DroidVM ARM64 drivers
+
+# 手動觸發，或 push 到 ci-build-drivers 分支
+on:
+  workflow_dispatch:
+  push:
+    branches: [ ci-build-drivers ]
+
+env:
+  CONFIG: "Win11 Release"
+  PLATFORM: "ARM64"
+  OSMASK: "Server10_ARM64"          # 與 build/Driver.PackOne.targets 一致（Win11/ARM64）
+  CERT_SUBJECT: "CN=DroidVM Test"
+  PFX_PW: "droidvm"
+
+jobs:
+  build:
+    # 你指定的 VS2026 runner。若此 label 無效，改 windows-2025 並在下方加裝 WDK。
+    runs-on: windows-2025-vs2026
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      # 診斷：列出可用的 Driver 平台工具集 / WDK，方便 build 失敗時定位
+      - name: Diagnose toolchain
+        shell: pwsh
+        run: |
+          Write-Host "=== VS instances ==="
+          & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -all -products * -format json | Out-String | Write-Host
+          Write-Host "=== Windows Kits bin ==="
+          Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -ErrorAction SilentlyContinue | Select Name
+          Write-Host "=== Driver platform toolset present? ==="
+          Get-ChildItem "C:\Program Files*\Microsoft Visual Studio\*\*\MSBuild\Microsoft\VC\*\Platforms\ARM64\PlatformToolsets" -ErrorAction SilentlyContinue |
+            Select-Object FullName
+
+      - name: Build ARM64 drivers (per project)
+        shell: pwsh
+        run: |
+          $projects = @(
+            'viostor/viostor.vcxproj',
+            'vioscsi/vioscsi.vcxproj',
+            'vioserial/sys/vioser.vcxproj',
+            'viorng/viorng/viorng.vcxproj',
+            'NetKVM/NetKVM-VS2015.vcxproj',
+            'viosock/sys/viosock.vcxproj',
+            'rdmapool/rdmapool.vcxproj'
+          )
+          $failed = @()
+          foreach ($p in $projects) {
+            Write-Host "::group::build $p"
+            msbuild $p /m `
+              /p:Configuration="$env:CONFIG" /p:Platform="$env:PLATFORM" `
+              /p:SpectreMitigation=false /p:SignMode=Off
+            if ($LASTEXITCODE -ne 0) { $failed += $p }
+            Write-Host "::endgroup::"
+          }
+          if ($failed.Count) { Write-Host "::warning::Failed projects: $($failed -join ', ')" }
+          # 不讓單一專案失敗中止整個 job；簽署/打包還是會處理已成功的部分
+
+      - name: Self-sign + package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $kit = "C:\Program Files (x86)\Windows Kits\10\bin"
+          $signtool = (Get-ChildItem "$kit\*\x64\signtool.exe"  | Sort FullName -Desc | Select -First 1).FullName
+          $inf2cat  = (Get-ChildItem "$kit\*\x86\inf2cat.exe"   | Sort FullName -Desc | Select -First 1).FullName
+          Write-Host "signtool=$signtool"; Write-Host "inf2cat=$inf2cat"
+
+          New-Item -ItemType Directory -Force out | Out-Null
+          $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "$env:CERT_SUBJECT" `
+                    -CertStoreLocation Cert:\CurrentUser\My -KeyExportPolicy Exportable `
+                    -KeyUsage DigitalSignature -NotAfter (Get-Date).AddYears(10)
+          $pw = ConvertTo-SecureString "$env:PFX_PW" -AsPlainText -Force
+          $pfx = "out\DroidVM_Test.pfx"
+          Export-PfxCertificate -Cert $cert -FilePath $pfx -Password $pw | Out-Null
+          Export-Certificate   -Cert $cert -FilePath "out\DroidVM_Test.cer" | Out-Null
+
+          $roots = 'viostor','vioscsi','vioserial','viorng','NetKVM','viosock','rdmapool'
+          foreach ($r in $roots) {
+            $dir = Get-ChildItem -Path $r -Recurse -Directory -ErrorAction SilentlyContinue |
+              Where-Object {
+                $_.FullName -match 'ARM64' -and
+                (Get-ChildItem $_.FullName -Filter *.inf -ErrorAction SilentlyContinue) -and
+                (Get-ChildItem $_.FullName -Filter *.sys -ErrorAction SilentlyContinue)
+              } | Select-Object -First 1
+            if (-not $dir) { Write-Host "::warning::no ARM64 output for $r"; continue }
+            $dest = "out\drivers\$r"; New-Item -ItemType Directory -Force $dest | Out-Null
+            Copy-Item "$($dir.FullName)\*.inf" $dest -ErrorAction SilentlyContinue
+            Copy-Item "$($dir.FullName)\*.sys" $dest -ErrorAction SilentlyContinue
+            Copy-Item "$($dir.FullName)\*.dll" $dest -ErrorAction SilentlyContinue
+            # 內嵌簽 .sys（boot driver winload 會檢查）
+            Get-ChildItem "$dest\*.sys" | ForEach-Object { & $signtool sign /fd SHA256 /f $pfx /p "$env:PFX_PW" $_.FullName }
+            # 重建 .cat（簽過 sys 後雜湊改變）並簽
+            Remove-Item "$dest\*.cat" -ErrorAction SilentlyContinue
+            & $inf2cat /driver:$dest /os:$env:OSMASK
+            Get-ChildItem "$dest\*.cat" | ForEach-Object { & $signtool sign /fd SHA256 /f $pfx /p "$env:PFX_PW" $_.FullName }
+            Write-Host "packed $r"
+          }
+          Remove-Item $pfx -Force   # 不上傳私鑰
+          Write-Host "=== staged ==="; Get-ChildItem -Recurse out | Select FullName
+
+      - name: Upload drivers artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: droidvm-arm64-drivers
+          path: out/**
+          if-no-files-found: warn
