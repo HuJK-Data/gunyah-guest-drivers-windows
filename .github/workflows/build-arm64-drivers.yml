@@ -52,6 +52,8 @@ jobs:
             @{ p='viosock/wspsvc/viosockwspsvc.vcxproj';    c='Win11 Release'; plat='ARM64' ; dep=$true },
             @{ p='NetKVM/ProtocolService/ProtocolService.vcxproj'; c='Win11 Release'; plat='ARM64' ; dep=$true },
             @{ p='viorng/cng/um/viorngum.vcxproj';          c='Win11 Release'; plat='ARM64' ; dep=$true },
+            @{ p='vioinput/hidpassthrough/hidpassthrough.vcxproj'; c='Win11 Release'; plat='ARM64' ; dep=$true },
+            @{ p='vioinput/sys/vioinput.vcxproj';           c='Win11 Release'; plat='ARM64' },
             @{ p='viostor/viostor.vcxproj';                 c='Win11 Release'; plat='ARM64' },
             @{ p='vioscsi/vioscsi.vcxproj';                 c='Win11 Release'; plat='ARM64' },
             @{ p='vioserial/sys/vioser.vcxproj';            c='Win11 Release'; plat='ARM64' },
@@ -99,6 +101,7 @@ jobs:
             @{ n='viorng';    root='viorng';    bins=@('viorng.sys','viorngum.dll'); inf='viorng.inf' },
             @{ n='viosock';   root='viosock';   bins=@('viosock.sys','viosocklib.dll','viosockwspsvc.exe'); inf='viosock.inf' },
             @{ n='NetKVM';    root='NetKVM';    bins=@('netkvm.sys','netkvmp.exe'); inf='netkvm.inf' },
+            @{ n='vioinput';  root='vioinput';  bins=@('vioinput.sys','viohidkmdf.sys'); inf='vioinput.inf' },
             @{ n='rdmapool';  root='rdmapool';  bins=@('rdmapool.sys'); inf='rdmapool.inf' }
           )
           # 在 root 下找最佳檔案：優先路徑含 ARM64、最新修改
