@@ -15,8 +15,8 @@ env:
 
 jobs:
   build:
-    # 你指定的 VS2026 runner。若此 label 無效，改 windows-2025 並在下方加裝 WDK。
-    runs-on: windows-2025-vs2026
+    # windows-2022 內建 WDK 22H2 + VS2022，可直接 msbuild（vs2026 runner 沒有 WDK 本體）。
+    runs-on: windows-2022
 
     steps:
       - name: Checkout
@@ -40,22 +40,23 @@ jobs:
       - name: Build ARM64 drivers (per project)
         shell: pwsh
         run: |
+          # 多數驅動用 "Win11 Release"；rdmapool 是獨立專案，config 為 "Release"
           $projects = @(
-            'viostor/viostor.vcxproj',
-            'vioscsi/vioscsi.vcxproj',
-            'vioserial/sys/vioser.vcxproj',
-            'viorng/viorng/viorng.vcxproj',
-            'NetKVM/NetKVM-VS2015.vcxproj',
-            'viosock/sys/viosock.vcxproj',
-            'rdmapool/rdmapool.vcxproj'
+            @{ p='viostor/viostor.vcxproj';      c='Win11 Release' },
+            @{ p='vioscsi/vioscsi.vcxproj';      c='Win11 Release' },
+            @{ p='vioserial/sys/vioser.vcxproj'; c='Win11 Release' },
+            @{ p='viorng/viorng/viorng.vcxproj'; c='Win11 Release' },
+            @{ p='NetKVM/NetKVM-VS2015.vcxproj'; c='Win11 Release' },
+            @{ p='viosock/sys/viosock.vcxproj';  c='Win11 Release' },
+            @{ p='rdmapool/rdmapool.vcxproj';    c='Release' }
           )
           $failed = @()
-          foreach ($p in $projects) {
-            Write-Host "::group::build $p"
-            msbuild $p /m `
-              /p:Configuration="$env:CONFIG" /p:Platform="$env:PLATFORM" `
+          foreach ($j in $projects) {
+            Write-Host "::group::build $($j.p) [$($j.c)|$env:PLATFORM]"
+            msbuild $j.p /m `
+              /p:Configuration="$($j.c)" /p:Platform="$env:PLATFORM" `
               /p:SpectreMitigation=false /p:SignMode=Off
-            if ($LASTEXITCODE -ne 0) { $failed += $p }
+            if ($LASTEXITCODE -ne 0) { $failed += $j.p }
             Write-Host "::endgroup::"
           }
           if ($failed.Count) { Write-Host "::warning::Failed projects: $($failed -join ', ')" }
