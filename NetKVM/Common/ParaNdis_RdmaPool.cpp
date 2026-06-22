@@ -97,7 +97,7 @@ NTSTATUS ParaNdis_RdmaPoolConnect(PARANDIS_ADAPTER *pContext)
     }
 
     RtlZeroMemory(&queryOutput, sizeof(queryOutput));
-    status = RdmaPoolIoctl(pContext, IOCTL_RDMAPOOL_QUERY_POOL,
+    status = RdmaPoolIoctl(pContext, (ULONG)IOCTL_RDMAPOOL_QUERY_POOL,
                            NULL, 0, &queryOutput, sizeof(queryOutput));
     if (!NT_SUCCESS(status))
     {
@@ -149,7 +149,7 @@ PVOID ParaNdis_RdmaPoolAllocate(PARANDIS_ADAPTER *pContext, ULONG size, PHYSICAL
     allocInput.NumPages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
     RtlZeroMemory(&allocOutput, sizeof(allocOutput));
 
-    status = RdmaPoolIoctl(pContext, IOCTL_RDMAPOOL_ALLOCATE,
+    status = RdmaPoolIoctl(pContext, (ULONG)IOCTL_RDMAPOOL_ALLOCATE,
                            &allocInput, sizeof(allocInput),
                            &allocOutput, sizeof(allocOutput));
     if (!NT_SUCCESS(status))
@@ -177,7 +177,7 @@ VOID ParaNdis_RdmaPoolFree(PARANDIS_ADAPTER *pContext, PVOID va, ULONG size)
     }
     freeInput.VirtualAddress = va;
     freeInput.NumPages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
-    (void)RdmaPoolIoctl(pContext, IOCTL_RDMAPOOL_FREE,
+    (void)RdmaPoolIoctl(pContext, (ULONG)IOCTL_RDMAPOOL_FREE,
                         &freeInput, sizeof(freeInput), NULL, 0);
 }
 
