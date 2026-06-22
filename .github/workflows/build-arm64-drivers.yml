@@ -37,6 +37,22 @@ jobs:
           Get-ChildItem "C:\Program Files*\Microsoft Visual Studio\*\*\MSBuild\Microsoft\VC\*\Platforms\ARM64\PlatformToolsets" -ErrorAction SilentlyContinue |
             Select-Object FullName
 
+      - name: Install CPDK (Cryptographic Provider Dev Kit, for viorng's CNG provider)
+        shell: pwsh
+        run: |
+          $hdr = 'C:\Program Files (x86)\Windows Kits\10\Cryptographic Provider Development Kit\Include\bcrypt_provider.h'
+          # 主：choco 套件
+          choco install windows-cryptographic-provider-development-kit -y --no-progress 2>&1 | Out-Host
+          if (-not (Test-Path $hdr)) {
+            # 備援：直接下載官方 cpdksetup.exe 靜默安裝
+            Write-Host "choco 未到位，改用 cpdksetup.exe"
+            $url='https://download.microsoft.com/download/1/7/6/176909B0-50F2-4DF3-B29B-830A17EA7E38/CPDK_RELEASE_UPDATE/cpdksetup.exe'
+            Invoke-WebRequest -Uri $url -OutFile cpdksetup.exe
+            Start-Process -FilePath .\cpdksetup.exe -ArgumentList '/q','/norestart' -Wait
+          }
+          if (Test-Path $hdr) { Write-Host "CPDK OK: $hdr" }
+          else { Write-Host "::warning::bcrypt_provider.h 仍找不到，viorng 可能建不起來" }
+
       - name: Build ARM64 drivers
         shell: pwsh
         run: |
