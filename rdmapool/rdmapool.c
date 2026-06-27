@@ -131,16 +131,29 @@ RdmaPoolEvtDevicePrepareHardware(_In_ WDFDEVICE Device,
                        devCtx->PoolPhysicalBase.QuadPart,
                        (ULONG64)devCtx->PoolSize);
 
-            /* Map the physical region into kernel virtual address space.
-             * Use cached mapping: this is real RAM (shared region in pVM),
-             * not device MMIO.  Uncached (PAGE_NOCACHE) would map as Device
-             * memory on ARM64, which forbids DC ZVA and requires strict
-             * alignment for SIMD stores, causing BSOD 0x7E in memset/RtlZeroMemory. */
-#if defined(NTDDI_WINTHRESHOLD) && (NTDDI_VERSION >= NTDDI_WINTHRESHOLD)
-            devCtx->PoolVirtualBase = MmMapIoSpaceEx(devCtx->PoolPhysicalBase, devCtx->PoolSize, PAGE_READWRITE);
-#else
-            devCtx->PoolVirtualBase = MmMapIoSpace(devCtx->PoolPhysicalBase, devCtx->PoolSize, MmCached);
-#endif
+            /* Map the shared pVM region cached AND hardware-coherent (ARM64:
+             * Normal Write-Back, Inner Shareable).
+             *
+             * The region holds the virtio vrings, shared with the host VMM
+             * (crosvm). crosvm marks the virtio PCI node "dma-coherent" in the
+             * guest FDT (aarch64/src/fdt.rs), so Linux maps its vring with
+             * dma_alloc_coherent = Normal WB Inner-Shareable and relies on
+             * hardware coherency between the guest CPU and the host core -- and
+             * it works. Plain MmCached / PAGE_READWRITE on a reserved-memory
+             * resource can land as cached but NOT Inner Shareable, so the guest's
+             * cached vring writes are not snooped by the host: the device sees a
+             * stale used_event and the guest sees a stale used->idx, and a
+             * completion becomes visible only when the cache line is evicted
+             * (~250ms StorPort watchdog) -- which collapses sequential QD1 I/O.
+             *
+             * MmHardwareCoherentCached forces the Inner-Shareable coherent
+             * attribute, matching Linux's dma-coherent vring, so guest<->host
+             * vring updates are coherent and completions are seen promptly. It
+             * stays cached (fast data copies) and Normal memory (DC ZVA works,
+             * no BSOD -- unlike PAGE_NOCACHE, which maps as Device memory). */
+            devCtx->PoolVirtualBase = MmMapIoSpace(devCtx->PoolPhysicalBase,
+                                                   devCtx->PoolSize,
+                                                   MmHardwareCoherentCached);
             if (devCtx->PoolVirtualBase == NULL)
             {
                 DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL, "rdmapool: MmMapIoSpace failed\n");
