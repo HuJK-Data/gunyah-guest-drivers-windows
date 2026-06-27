@@ -434,6 +434,11 @@ VirtIoFindAdapter(IN PVOID DeviceExtension,
     }
 
     ConfigInfo->MaximumTransferLength = ConfigInfo->NumberOfPhysicalBreaks * PAGE_SIZE;
+    if (ConfigInfo->MaximumTransferLength > VIOSTOR_MAX_TRANSFER_LENGTH_CAP)
+    {
+        ConfigInfo->MaximumTransferLength = VIOSTOR_MAX_TRANSFER_LENGTH_CAP;
+        ConfigInfo->NumberOfPhysicalBreaks = ConfigInfo->MaximumTransferLength / PAGE_SIZE;
+    }
     ConfigInfo->NumberOfPhysicalBreaks++;
     adaptExt->max_tx_length = ConfigInfo->MaximumTransferLength;
 

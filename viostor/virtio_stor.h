@@ -96,6 +96,10 @@ typedef struct VirtIOBufferDescriptor VIO_SG, *PVIO_SG;
 #define MAX_PHYS_SEGMENTS                  512
 #define VIRTIO_MAX_SG                      (3 + MAX_PHYS_SEGMENTS)
 
+/* Keep advertised SRB transfers below the 1MiB boundary where DroidVM's
+ * restricted-DMA virtio-blk path can fall back to watchdog-paced completion. */
+#define VIOSTOR_MAX_TRANSFER_LENGTH_CAP    (960 * 1024)
+
 #define VIOBLK_POOL_TAG                    'BoiV'
 
 /* Completion-poll fallback period, microseconds (worst-case extra latency for a
