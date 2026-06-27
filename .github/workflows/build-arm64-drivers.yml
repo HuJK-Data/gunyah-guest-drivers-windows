@@ -21,6 +21,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 需要完整歷史：driver 版號第四段用 commit 數（shallow 會變成 1）
 
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@v2
@@ -58,7 +60,14 @@ jobs:
         run: |
           # 逐 vcxproj 建，先按相依順序建 deps（msbuild sln /t:proj 不可靠，會把名稱當 target）：
           #   Mof(產 netkvmmof.h) -> VirtioLib / VirtioLib-WDF -> CoInstaller -> 各驅動 -> rdmapool
-          $common = @('/m','/p:ApiValidator_Enable=false','/p:SpectreMitigation=false','/p:SignMode=Off')
+          # Driver 版號 = 100.6.102.<commit數>。第三段 101->102 確保永遠比現役 100.6.101.* 新；
+          # 第四段用 commit 數，每次 commit 單調遞增（16-bit 上限 65535，餘裕約 6 萬）。
+          # 對未用 Driver.RHEL.props 的專案（如 rdmapool）這兩個 /p: 是未使用屬性，無副作用。
+          $commitCount = (& git rev-list --count HEAD | Out-String).Trim()
+          if (-not ($commitCount -match '^[0-9]+$')) { $commitCount = '0' }
+          Write-Host "Driver version = 100.6.102.$commitCount"
+          $common = @('/m','/p:ApiValidator_Enable=false','/p:SpectreMitigation=false','/p:SignMode=Off',
+                      '/p:_BUILD_MAJOR_VERSION_=102', "/p:_BUILD_MINOR_VERSION_=$commitCount")
           $jobs = @(
             @{ p='NetKVM/Mof/Mof.vcxproj';                  c='Header';        plat='x64'   ; dep=$true },
             @{ p='VirtIO/VirtioLib.vcxproj';                c='Win11 Release'; plat='ARM64' ; dep=$true },
