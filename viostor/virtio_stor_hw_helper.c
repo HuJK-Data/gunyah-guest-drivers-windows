@@ -85,7 +85,7 @@ static ULONG GetSrbQueueNumber(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
     {
         QueueNumber = (param.MessageNumber - 1) % adaptExt->num_queues;
     }
-    RhelDbgPrint(TRACE_LEVEL_INFORMATION,
+    RhelDbgPrint(TRACE_LEVEL_VERBOSE,
                  " srb %p, MessageNumber %lu, ChannelNumber %lu -> QueueNumber %lu\n",
                  Srb,
                  param.MessageNumber,
@@ -127,7 +127,7 @@ RhelDoFlush(PVOID DeviceExtension, PSRB_TYPE Srb, BOOLEAN resend, BOOLEAN bIsr)
             return FALSE;
         }
         srbExt->bounceCtl = ctlSlot;
-        srbExt->bounceDataPageCount = 0;
+        srbExt->bounceDataChunkCount = 0;
     }
 
     SET_VA_PA();
@@ -415,7 +415,7 @@ RhelDoUnMap(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
             return FALSE;
         }
         srbExt->bounceCtl = ctlSlot;
-        srbExt->bounceDataPageCount = 0;
+        srbExt->bounceDataChunkCount = 0;
     }
 
     SET_VA_PA();
@@ -552,7 +552,7 @@ RhelGetSerialNumber(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
             return TRUE;
         }
         srbExt->bounceCtl = ctlSlot;
-        srbExt->bounceDataPageCount = 0;
+        srbExt->bounceDataChunkCount = 0;
     }
 
     SET_VA_PA();
