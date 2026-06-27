@@ -2577,18 +2577,12 @@ VOID VioStorArmCompletionPoll(IN PVOID DeviceExtension)
 {
     PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
 
+    /* Timer is created once at passive init (StorPortInitializeTimer requires
+     * PASSIVE_LEVEL, so it must NOT be created here on the DISPATCH submit path).
+     * If it isn't ready, skip: completions then rely on the interrupt. */
     if (adaptExt->completionPollTimer == NULL)
     {
-        /* Lazy init as a backstop in case the passive-init routine did not run.
-         * StorPortInitializeTimer is callable at <= DISPATCH. Publish the handle
-         * atomically; if two CPUs race, the loser orphans its timer (one-time,
-         * negligible -- there is no StorPort API to free one). */
-        PVOID timer = NULL;
-        if (StorPortInitializeTimer(DeviceExtension, &timer) != STOR_STATUS_SUCCESS || timer == NULL)
-        {
-            return;
-        }
-        InterlockedCompareExchangePointer(&adaptExt->completionPollTimer, timer, NULL);
+        return;
     }
     /* Schedule only if not already scheduled (the running timer re-arms itself
      * while work remains). */
