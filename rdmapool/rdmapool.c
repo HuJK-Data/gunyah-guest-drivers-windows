@@ -131,15 +131,38 @@ RdmaPoolEvtDevicePrepareHardware(_In_ WDFDEVICE Device,
                        devCtx->PoolPhysicalBase.QuadPart,
                        (ULONG64)devCtx->PoolSize);
 
-            /* Map the physical region into kernel virtual address space.
-             * Use cached mapping: this is real RAM (shared region in pVM),
-             * not device MMIO.  Uncached (PAGE_NOCACHE) would map as Device
-             * memory on ARM64, which forbids DC ZVA and requires strict
-             * alignment for SIMD stores, causing BSOD 0x7E in memset/RtlZeroMemory. */
+            /* Map the shared pVM region WRITE-COMBINED (ARM64: Normal
+             * Non-Cacheable), NOT cached.
+             *
+             * Why not cached: this region holds the virtio vrings, whose tiny
+             * control fields (used->idx, used_event, avail->flags) are read and
+             * written by BOTH the guest and the host VMM (crosvm) with no
+             * hardware cache coherency across the pVM boundary. A cached guest
+             * mapping leaves those writes in the guest's cache; crosvm reads
+             * stale values and suppresses completion interrupts (~half of
+             * large-I/O completions miss their IRQ and are only reaped ~250ms
+             * later by the StorPort watchdog -> sequential throughput collapses
+             * to ~4 IOPS). Linux avoids this by allocating the vring with
+             * dma_alloc_coherent (= Normal Non-Cacheable); this is the Windows
+             * equivalent.
+             *
+             * Why WRITE-COMBINED and not PAGE_NOCACHE: on ARM64 PAGE_NOCACHE
+             * maps as Device memory, which forbids DC ZVA and requires strict
+             * SIMD alignment -> BSOD 0x7E in memset/RtlZeroMemory. WRITE_COMBINE
+             * is Normal Non-Cacheable, so it is host-coherent (no cache) yet
+             * still allows DC ZVA and unaligned access. Ordering is provided by
+             * the virtio code's KeMemoryBarrier (DMB) sites.
+             *
+             * NOTE: data-buffer copies through this region are also uncached
+             * (slower). A follow-up split (WC vrings + cached data) restores
+             * copy speed; this whole-pool WC mapping is the minimal, correct
+             * coherency fix. */
 #if defined(NTDDI_WINTHRESHOLD) && (NTDDI_VERSION >= NTDDI_WINTHRESHOLD)
-            devCtx->PoolVirtualBase = MmMapIoSpaceEx(devCtx->PoolPhysicalBase, devCtx->PoolSize, PAGE_READWRITE);
+            devCtx->PoolVirtualBase = MmMapIoSpaceEx(devCtx->PoolPhysicalBase,
+                                                     devCtx->PoolSize,
+                                                     PAGE_READWRITE | PAGE_WRITECOMBINE);
 #else
-            devCtx->PoolVirtualBase = MmMapIoSpace(devCtx->PoolPhysicalBase, devCtx->PoolSize, MmCached);
+            devCtx->PoolVirtualBase = MmMapIoSpace(devCtx->PoolPhysicalBase, devCtx->PoolSize, MmWriteCombined);
 #endif
             if (devCtx->PoolVirtualBase == NULL)
             {
