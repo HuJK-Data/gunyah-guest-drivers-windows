@@ -598,10 +598,32 @@ VOID RhelSetGuestFeatures(IN PVOID DeviceExtension)
         guestFeatures |= (1ULL << VIRTIO_F_ANY_LAYOUT);
     }
 
-    if (CHECKBIT(adaptExt->features, VIRTIO_RING_F_EVENT_IDX))
-    {
-        guestFeatures |= (1ULL << VIRTIO_RING_F_EVENT_IDX);
-    }
+    /*
+     * Intentionally do NOT negotiate VIRTIO_RING_F_EVENT_IDX on this
+     * (Gunyah restricted-DMA-pool / protected VM) transport.
+     *
+     * EVENT_IDX replaces the simple NO_INTERRUPT/NO_NOTIFY flags with a
+     * one-shot index threshold: the device only raises a completion
+     * interrupt once vring used->idx crosses the driver-published
+     * used_event. Both indices live in the shared vring inside the
+     * restricted DMA pool, and the device's decision depends on it reading
+     * the driver's freshly written used_event coherently. On this transport
+     * that cross-side coherency is not reliable, so the device intermittently
+     * reads a stale used_event and suppresses a completion interrupt that
+     * should have fired; the request is then only reaped ~250ms later by the
+     * watchdog. That shows up as a bimodal ~0.5ms / ~250ms completion latency
+     * which collapses sequential throughput (a single missed interrupt pins
+     * QD1 large-block I/O to ~4 IOPS).
+     *
+     * Declining EVENT_IDX (event_suppression_enabled = FALSE) reverts to the
+     * flag-based scheme, where the device re-reads avail->flags on every
+     * completion while interrupts are enabled -- self-healing against a stale
+     * read instead of a one-shot miss. We give up interrupt coalescing, which
+     * is an acceptable trade for not losing interrupts.
+     *
+     * if (CHECKBIT(adaptExt->features, VIRTIO_RING_F_EVENT_IDX))
+     *     guestFeatures |= (1ULL << VIRTIO_RING_F_EVENT_IDX);
+     */
 
     if (CHECKBIT(adaptExt->features, VIRTIO_RING_F_INDIRECT_DESC))
     {
