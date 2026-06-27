@@ -37,15 +37,17 @@
  * single 4KB pages. Each chunk is physically contiguous, so a chunk maps to a
  * single virtqueue descriptor (provided chunk size <= device size_max). This
  * collapses a large transfer from one-descriptor-per-page (e.g. 256 for 1MB)
- * down to ceil(transfer / chunk) descriptors (e.g. 8 for 1MB @ 128KB chunks),
+ * down to ceil(transfer / chunk) descriptors (e.g. 6 for 1MB @ 192KB chunks),
  * which is the dominant cost for the device/hypervisor in a protected VM.
+ * Keep chunks below 256KB so 1MB requests do not form a 4 x 256KB descriptor
+ * pattern, which is watchdog-paced on the DroidVM restricted-DMA storage path.
  *
  * The chunk size is clamped down to the device's size_max, and further reduced
  * if needed so the pool yields at least CtlSlotCount (queue_depth) chunks (see
  * BounceInit) — so large transfers stay cheap without starving small-I/O
  * concurrency.
  */
-#define BOUNCE_DATA_CHUNK_SIZE     (256 * 1024)
+#define BOUNCE_DATA_CHUNK_SIZE     (192 * 1024)
 
 typedef struct _BOUNCE_ALLOCATOR
 {
