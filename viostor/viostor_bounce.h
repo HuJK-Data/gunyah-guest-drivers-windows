@@ -138,4 +138,21 @@ BouncePAtoVA(PBOUNCE_ALLOCATOR Alloc, PHYSICAL_ADDRESS PA)
         }                                                                                                              \
     } while (0)
 
+#define BOUNCE_CLEANUP_SPLIT_CHILD(pAdaptExt, pChild)                                                                  \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        if ((pChild)->bounceCtl)                                                                                       \
+        {                                                                                                              \
+            ULONG _bci;                                                                                                \
+            for (_bci = 1; _bci <= (pChild)->bounceDataChunkCount; _bci++)                                             \
+            {                                                                                                          \
+                BounceFreeDataChunk(&(pAdaptExt)->bounce,                                                              \
+                                    BouncePAtoVA(&(pAdaptExt)->bounce, (pChild)->sg[_bci].physAddr));                  \
+            }                                                                                                          \
+            BounceFreeCtl(&(pAdaptExt)->bounce, (pChild)->bounceCtl);                                                  \
+            (pChild)->bounceCtl = NULL;                                                                                \
+            (pChild)->bounceDataChunkCount = 0;                                                                        \
+        }                                                                                                              \
+    } while (0)
+
 #endif /* _VIOSTOR_BOUNCE_H_ */

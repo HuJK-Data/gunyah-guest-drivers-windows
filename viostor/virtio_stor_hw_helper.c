@@ -95,6 +95,135 @@ static ULONG GetSrbQueueNumber(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
     return QueueNumber;
 }
 
+static VOID RhelGetSplitChildIndirect(IN PADAPTER_EXTENSION adaptExt,
+                                      IN PVIOSTOR_SPLIT_CHILD child,
+                                      OUT PVOID *va,
+                                      OUT ULONGLONG *pa)
+{
+    if (adaptExt->indirect && adaptExt->rdmaPoolActive && child->bounceCtl)
+    {
+        PVOID indirectVa = (PUCHAR)child->bounceCtl + BOUNCE_CTL_INDIRECT_OFFSET;
+        *va = indirectVa;
+        *pa = BounceVAtoPA(&adaptExt->bounce, indirectVa).QuadPart;
+    }
+    else
+    {
+        *va = NULL;
+        *pa = 0;
+    }
+}
+
+static BOOLEAN RhelDoSplitReadWrite(PVOID DeviceExtension, PSRB_TYPE Srb)
+{
+    PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
+    PSRB_EXTENSION srbExt = SRB_EXTENSION(Srb);
+    ULONG QueueNumber = GetSrbQueueNumber(DeviceExtension, Srb);
+    ULONG MessageId = QueueToMessageId(DeviceExtension, QueueNumber);
+    STOR_LOCK_HANDLE LockHandle = {0};
+    struct virtqueue *vq = adaptExt->vq[QueueNumber];
+    PREQUEST_LIST element;
+    ULONG added = 0;
+    ULONG i;
+    BOOLEAN notify = FALSE;
+    BOOLEAN result = FALSE;
+    BOOLEAN busy = FALSE;
+
+    srbExt->queue_number = QueueNumber;
+
+    VioStorVQLock(DeviceExtension, MessageId, &LockHandle, FALSE);
+
+    if (adaptExt->reset_in_progress_count)
+    {
+        VioStorVQUnlock(DeviceExtension, MessageId, &LockHandle, FALSE);
+
+        for (i = 0; i < srbExt->splitChildCount; i++)
+        {
+            BOUNCE_CLEANUP_SPLIT_CHILD(adaptExt, &srbExt->splitChildren[i]);
+        }
+        srbExt->split = FALSE;
+        SRB_SET_DATA_TRANSFER_LENGTH(Srb, 0);
+        CompleteRequestWithStatus(DeviceExtension, Srb, SRB_STATUS_BUS_RESET);
+        return TRUE;
+    }
+
+    element = &adaptExt->processing_srbs[QueueNumber];
+
+    for (i = 0; i < srbExt->splitChildCount; i++)
+    {
+        PVIOSTOR_SPLIT_CHILD child = &srbExt->splitChildren[i];
+        PVOID va = NULL;
+        ULONGLONG pa = 0ULL;
+        ULONG_PTR id = element->next_id;
+
+        if (id == 0)
+        {
+            id++;
+        }
+
+        child->vbr.id = id;
+        element->next_id = ++id;
+        RhelGetSplitChildIndirect(adaptExt, child, &va, &pa);
+
+        if (virtqueue_add_buf(vq, &child->sg[0], child->out, child->in, (void *)child->vbr.id, va, pa) !=
+            VQ_ADD_BUFFER_SUCCESS)
+        {
+            ULONG cleanupIndex;
+
+            RhelDbgPrint(TRACE_LEVEL_ERROR, " Split: can not add child %lu to queue %lu.\n", i, QueueNumber);
+            BOUNCE_CLEANUP_SPLIT_CHILD(adaptExt, child);
+            for (cleanupIndex = i + 1; cleanupIndex < srbExt->splitChildCount; cleanupIndex++)
+            {
+                BOUNCE_CLEANUP_SPLIT_CHILD(adaptExt, &srbExt->splitChildren[cleanupIndex]);
+            }
+            break;
+        }
+
+        InsertTailList(&element->srb_list, &child->vbr.list_entry);
+        element->srb_cnt++;
+        added++;
+#ifdef DBG
+        InterlockedIncrement((LONG volatile *)&adaptExt->inqueue_cnt);
+#endif
+    }
+
+    if (added == srbExt->splitChildCount)
+    {
+        result = TRUE;
+    }
+    else if (added > 0)
+    {
+        srbExt->splitChildCount = added;
+        srbExt->splitRemaining = added;
+        srbExt->splitStatus = SRB_STATUS_BUSY;
+        result = TRUE;
+    }
+    else
+    {
+        srbExt->split = FALSE;
+        busy = TRUE;
+    }
+
+    if (result)
+    {
+        virtqueue_kick_prepare(vq);
+        notify = TRUE;
+    }
+
+    VioStorVQUnlock(DeviceExtension, MessageId, &LockHandle, FALSE);
+
+    if (notify)
+    {
+        virtqueue_notify(vq);
+        VioStorArmCompletionPoll(DeviceExtension);
+    }
+    if (busy)
+    {
+        StorPortBusy(DeviceExtension, 2);
+    }
+
+    return result;
+}
+
 BOOLEAN
 RhelDoFlush(PVOID DeviceExtension, PSRB_TYPE Srb, BOOLEAN resend, BOOLEAN bIsr)
 {
@@ -188,6 +317,7 @@ RhelDoFlush(PVOID DeviceExtension, PSRB_TYPE Srb, BOOLEAN resend, BOOLEAN bIsr)
         }
 
         srbExt->id = id;
+        srbExt->vbr.id = id;
         element->next_id = ++id;
     }
     else
@@ -237,6 +367,7 @@ RhelDoFlush(PVOID DeviceExtension, PSRB_TYPE Srb, BOOLEAN resend, BOOLEAN bIsr)
     if (notify)
     {
         virtqueue_notify(vq);
+        VioStorArmCompletionPoll(DeviceExtension);
     }
 
     return result;
@@ -258,6 +389,11 @@ RhelDoReadWrite(PVOID DeviceExtension, PSRB_TYPE Srb)
     STOR_LOCK_HANDLE LockHandle = {0};
     struct virtqueue *vq = NULL;
     PREQUEST_LIST element;
+
+    if (srbExt->split)
+    {
+        return RhelDoSplitReadWrite(DeviceExtension, Srb);
+    }
 
     SET_VA_PA();
 
@@ -290,6 +426,7 @@ RhelDoReadWrite(PVOID DeviceExtension, PSRB_TYPE Srb)
     }
 
     srbExt->id = id;
+    srbExt->vbr.id = id;
     element->next_id = ++id;
 
     if (virtqueue_add_buf(vq, &srbExt->sg[0], srbExt->out, srbExt->in, (void *)srbExt->id, va, pa) ==
@@ -498,6 +635,7 @@ RhelDoUnMap(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
     }
 
     srbExt->id = id;
+    srbExt->vbr.id = id;
     element->next_id = ++id;
 
     if (virtqueue_add_buf(vq, &srbExt->sg[0], srbExt->out, srbExt->in, (void *)srbExt->id, va, pa) ==
@@ -627,6 +765,7 @@ RhelGetSerialNumber(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
     }
 
     srbExt->id = id;
+    srbExt->vbr.id = id;
     element->next_id = ++id;
 
     if (virtqueue_add_buf(vq, &srbExt->sg[0], srbExt->out, srbExt->in, (void *)srbExt->id, va, pa) ==

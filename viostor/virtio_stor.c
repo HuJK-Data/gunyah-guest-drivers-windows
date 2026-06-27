@@ -123,6 +123,252 @@ UCHAR FirmwareRequest(IN PVOID DeviceExtension, IN PSRB_TYPE Srb);
 
 VOID ReportDeviceIdentifier(IN PVOID DeviceExtension, IN PSRB_TYPE Srb);
 
+UCHAR DeviceToSrbStatus(UCHAR status);
+
+static VOID VioStorCleanupSplitChildren(IN PADAPTER_EXTENSION adaptExt, IN PSRB_EXTENSION srbExt)
+{
+    ULONG i;
+
+    for (i = 0; i < srbExt->splitChildCount && i < VIOSTOR_SPLIT_MAX_CHILDREN; i++)
+    {
+        BOUNCE_CLEANUP_SPLIT_CHILD(adaptExt, &srbExt->splitChildren[i]);
+    }
+}
+
+static BOOLEAN VioStorIsSplitChild(IN PSRB_EXTENSION srbExt, IN pblk_req req, OUT PVIOSTOR_SPLIT_CHILD *child)
+{
+    ULONG i;
+
+    if (!srbExt->split || req == &srbExt->vbr)
+    {
+        return FALSE;
+    }
+
+    for (i = 0; i < srbExt->splitChildCount && i < VIOSTOR_SPLIT_MAX_CHILDREN; i++)
+    {
+        if (req == &srbExt->splitChildren[i].vbr)
+        {
+            if (child)
+            {
+                *child = &srbExt->splitChildren[i];
+            }
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+static VOID VioStorCompleteSplitParentUnlocked(IN PVOID DeviceExtension, IN PSRB_TYPE Srb, IN UCHAR status)
+{
+    PSRB_EXTENSION srbExt = SRB_EXTENSION(Srb);
+
+    srbExt->split = FALSE;
+    srbExt->originalDataVA = NULL;
+
+    if (status == SRB_STATUS_SUCCESS && srbExt->fua && (SRB_FLAGS(Srb) & SRB_FLAGS_DATA_OUT))
+    {
+        srbExt->fua = FALSE;
+        SRB_SET_SRB_STATUS(Srb, SRB_STATUS_PENDING);
+        if (RhelDoFlush(DeviceExtension, Srb, FALSE, FALSE))
+        {
+            return;
+        }
+        status = SRB_STATUS_ERROR;
+    }
+
+    CompleteRequestWithStatus(DeviceExtension, Srb, status);
+}
+
+static VOID VioStorCompleteSplitChildUnlocked(IN PVOID DeviceExtension, IN PSRB_TYPE Srb, IN PVIOSTOR_SPLIT_CHILD child)
+{
+    PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
+    PSRB_EXTENSION srbExt = SRB_EXTENSION(Srb);
+    UCHAR srbStatus;
+    LONG remaining;
+
+    if (child->bounceCtl)
+    {
+        child->vbr.status = *((u8 *)((PUCHAR)child->bounceCtl + BOUNCE_CTL_STATUS_OFFSET));
+    }
+
+    srbStatus = DeviceToSrbStatus(child->vbr.status);
+    if (srbStatus == SRB_STATUS_SUCCESS && child->vbr.out_hdr.type == VIRTIO_BLK_T_IN && child->originalDataVA != NULL)
+    {
+        SIZE_T offset = 0;
+        ULONG bIdx;
+
+        for (bIdx = 1; bIdx <= child->bounceDataChunkCount; bIdx++)
+        {
+            PVOID srcVA = BouncePAtoVA(&adaptExt->bounce, child->sg[bIdx].physAddr);
+            RtlCopyMemory((PUCHAR)child->originalDataVA + child->dataOffset + offset, srcVA, child->sg[bIdx].length);
+            offset += child->sg[bIdx].length;
+        }
+    }
+
+    BOUNCE_CLEANUP_SPLIT_CHILD(adaptExt, child);
+
+    if (srbStatus != SRB_STATUS_SUCCESS)
+    {
+        InterlockedCompareExchange((LONG volatile *)&srbExt->splitStatus, srbStatus, SRB_STATUS_SUCCESS);
+    }
+
+    remaining = InterlockedDecrement((LONG volatile *)&srbExt->splitRemaining);
+    if (remaining == 0)
+    {
+        UCHAR finalStatus = (UCHAR)srbExt->splitStatus;
+
+        VioStorCompleteSplitParentUnlocked(DeviceExtension, Srb, finalStatus);
+    }
+}
+
+static BOOLEAN VioStorPrepareSplitReadWrite(IN PVOID DeviceExtension, IN PSRB_TYPE Srb, IN ULONGLONG lba)
+{
+    PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
+    PSRB_EXTENSION srbExt = SRB_EXTENSION(Srb);
+    ULONG totalDataLen = SRB_DATA_TRANSFER_LENGTH(Srb);
+    BOOLEAN isWrite = !!(SRB_FLAGS(Srb) & SRB_FLAGS_DATA_OUT);
+    ULONG childCount;
+    ULONG childIndex;
+    PVOID dataVA = NULL;
+    ULONG sysAddrStatus;
+
+    if (!adaptExt->rdmaPoolActive || !adaptExt->bounce.Initialized || totalDataLen <= VIOSTOR_MAX_TRANSFER_LENGTH_CAP ||
+        totalDataLen > (VIOSTOR_SPLIT_CHILD_LENGTH * VIOSTOR_SPLIT_MAX_CHILDREN) ||
+        (totalDataLen & (SECTOR_SIZE - 1)) != 0)
+    {
+        return FALSE;
+    }
+
+    sysAddrStatus = StorPortGetSystemAddress(DeviceExtension, Srb, &dataVA);
+    if (sysAddrStatus != STOR_STATUS_SUCCESS || dataVA == NULL)
+    {
+        RhelDbgPrint(TRACE_LEVEL_ERROR, " Split: StorPortGetSystemAddress failed 0x%x\n", sysAddrStatus);
+        CompleteRequestWithStatus(DeviceExtension, Srb, SRB_STATUS_ERROR);
+        return FALSE;
+    }
+
+    childCount = (totalDataLen + VIOSTOR_SPLIT_CHILD_LENGTH - 1) / VIOSTOR_SPLIT_CHILD_LENGTH;
+    if (childCount == 0 || childCount > VIOSTOR_SPLIT_MAX_CHILDREN)
+    {
+        return FALSE;
+    }
+
+    srbExt->split = TRUE;
+    srbExt->splitChildCount = childCount;
+    srbExt->splitRemaining = childCount;
+    srbExt->splitStatus = SRB_STATUS_SUCCESS;
+    srbExt->originalDataVA = dataVA;
+    srbExt->bounceCtl = NULL;
+    srbExt->bounceDataChunkCount = 0;
+
+    for (childIndex = 0; childIndex < childCount; childIndex++)
+    {
+        PVIOSTOR_SPLIT_CHILD child = &srbExt->splitChildren[childIndex];
+        ULONG childOffset = childIndex * VIOSTOR_SPLIT_CHILD_LENGTH;
+        ULONG childLen = min(VIOSTOR_SPLIT_CHILD_LENGTH, totalDataLen - childOffset);
+        ULONG newSgIdx = 1;
+        ULONG dataOffset = 0;
+        ULONG requiredSg;
+
+        RtlZeroMemory(child, sizeof(*child));
+
+        if (adaptExt->bounce.DataChunkSize == 0)
+        {
+            RhelDbgPrint(TRACE_LEVEL_ERROR, " Split: invalid zero data chunk size\n");
+            VioStorCleanupSplitChildren(adaptExt, srbExt);
+            srbExt->split = FALSE;
+            CompleteRequestWithStatus(DeviceExtension, Srb, SRB_STATUS_ERROR);
+            return FALSE;
+        }
+
+        requiredSg = ((childLen + adaptExt->bounce.DataChunkSize - 1) / adaptExt->bounce.DataChunkSize) + 2;
+        if (requiredSg > VIOSTOR_SPLIT_MAX_SG)
+        {
+            RhelDbgPrint(TRACE_LEVEL_ERROR, " Split: too many SG entries %lu\n", requiredSg);
+            VioStorCleanupSplitChildren(adaptExt, srbExt);
+            srbExt->split = FALSE;
+            CompleteRequestWithStatus(DeviceExtension, Srb, SRB_STATUS_BAD_SRB_BLOCK_LENGTH);
+            return FALSE;
+        }
+
+        child->bounceCtl = BounceAllocCtl(&adaptExt->bounce);
+        if (!child->bounceCtl)
+        {
+            RhelDbgPrint(TRACE_LEVEL_ERROR, " Split: no control slots available\n");
+            VioStorCleanupSplitChildren(adaptExt, srbExt);
+            srbExt->split = FALSE;
+            CompleteRequestWithStatus(DeviceExtension, Srb, SRB_STATUS_BUSY);
+            return FALSE;
+        }
+
+        child->originalDataVA = dataVA;
+        child->dataOffset = childOffset;
+        child->dataLength = childLen;
+        child->vbr.req = Srb;
+        child->vbr.out_hdr.type = isWrite ? VIRTIO_BLK_T_OUT : VIRTIO_BLK_T_IN;
+        child->vbr.out_hdr.ioprio = 0;
+        child->vbr.out_hdr.sector = lba + (childOffset / SECTOR_SIZE);
+
+        RtlCopyMemory((PUCHAR)child->bounceCtl + BOUNCE_CTL_OUTHDR_OFFSET,
+                      &child->vbr.out_hdr,
+                      sizeof(child->vbr.out_hdr));
+
+        child->sg[0].physAddr = BounceVAtoPA(&adaptExt->bounce, (PUCHAR)child->bounceCtl + BOUNCE_CTL_OUTHDR_OFFSET);
+        child->sg[0].length = sizeof(child->vbr.out_hdr);
+
+        while (dataOffset < childLen)
+        {
+            PVOID bounceChunk = BounceAllocDataChunk(&adaptExt->bounce);
+            ULONG chunkLen;
+
+            if (!bounceChunk)
+            {
+                RhelDbgPrint(TRACE_LEVEL_ERROR, " Split: no data chunks\n");
+                VioStorCleanupSplitChildren(adaptExt, srbExt);
+                srbExt->split = FALSE;
+                CompleteRequestWithStatus(DeviceExtension, Srb, SRB_STATUS_BUSY);
+                return FALSE;
+            }
+
+            child->bounceDataChunkCount++;
+            chunkLen = min(adaptExt->bounce.DataChunkSize, childLen - dataOffset);
+            if (isWrite)
+            {
+                RtlCopyMemory(bounceChunk, (PUCHAR)dataVA + childOffset + dataOffset, chunkLen);
+            }
+
+            child->sg[newSgIdx].physAddr = BounceVAtoPA(&adaptExt->bounce, bounceChunk);
+            child->sg[newSgIdx].length = chunkLen;
+            newSgIdx++;
+            dataOffset += chunkLen;
+        }
+
+        child->sg[newSgIdx].physAddr = BounceVAtoPA(&adaptExt->bounce,
+                                                    (PUCHAR)child->bounceCtl + BOUNCE_CTL_STATUS_OFFSET);
+        child->sg[newSgIdx].length = sizeof(child->vbr.status);
+
+        if (isWrite)
+        {
+            child->out = newSgIdx;
+            child->in = 1;
+        }
+        else
+        {
+            child->out = 1;
+            child->in = newSgIdx;
+        }
+    }
+
+    RhelDbgPrint(TRACE_LEVEL_INFORMATION,
+                 " Split: srb %p len=%lu children=%lu child_len=%lu\n",
+                 Srb,
+                 totalDataLen,
+                 childCount,
+                 VIOSTOR_SPLIT_CHILD_LENGTH);
+    return TRUE;
+}
+
 #ifdef EVENT_TRACING
 VOID WppCleanupRoutine(PVOID arg1)
 {
@@ -954,6 +1200,24 @@ static VOID CompletePendingRequestsOnReset(IN PVOID DeviceExtension)
                     PSRB_EXTENSION srbExt = SRB_EXTENSION((PSRB_TYPE)Srb);
                     if (srbExt)
                     {
+                        PVIOSTOR_SPLIT_CHILD splitChild = NULL;
+
+                        if (VioStorIsSplitChild(srbExt, req, &splitChild))
+                        {
+                            BOUNCE_CLEANUP_SPLIT_CHILD(adaptExt, splitChild);
+                            InterlockedCompareExchange((LONG volatile *)&srbExt->splitStatus,
+                                                       SRB_STATUS_BUS_RESET,
+                                                       SRB_STATUS_SUCCESS);
+                            if (InterlockedDecrement((LONG volatile *)&srbExt->splitRemaining) == 0)
+                            {
+                                srbExt->split = FALSE;
+                                SRB_SET_DATA_TRANSFER_LENGTH(Srb, 0);
+                                CompleteRequestWithStatus(DeviceExtension, (PSRB_TYPE)Srb, (UCHAR)srbExt->splitStatus);
+                            }
+                            element->srb_cnt--;
+                            continue;
+                        }
+
                         BOUNCE_CLEANUP_SRB(adaptExt, srbExt);
                     }
                     SRB_SET_DATA_TRANSFER_LENGTH(Srb, 0);
@@ -1696,6 +1960,14 @@ VirtIoBuildIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
         srbExt->vbr.out_hdr.type = VIRTIO_BLK_T_IN;
         srbExt->out = 1;
         srbExt->in = sgElement;
+    }
+
+    if (adaptExt->rdmaPoolActive && adaptExt->bounce.Initialized &&
+        SRB_DATA_TRANSFER_LENGTH(Srb) > VIOSTOR_MAX_TRANSFER_LENGTH_CAP &&
+        SRB_DATA_TRANSFER_LENGTH(Srb) <= (VIOSTOR_SPLIT_CHILD_LENGTH * VIOSTOR_SPLIT_MAX_CHILDREN) &&
+        (SRB_DATA_TRANSFER_LENGTH(Srb) & (SECTOR_SIZE - 1)) == 0)
+    {
+        return VioStorPrepareSplitReadWrite(DeviceExtension, (PSRB_TYPE)Srb, lba);
     }
 
     /* Bounce buffer setup for restricted DMA pool */
@@ -2455,13 +2727,14 @@ VOID VioStorCompleteRequest(IN PVOID DeviceExtension, IN ULONG MessageID, IN BOO
         while ((srbId = (ULONG_PTR)virtqueue_get_buf(vq, &len)) != 0)
         {
             PLIST_ENTRY le = NULL;
+            pblk_req req = NULL;
             BOOLEAN bFound = FALSE;
 #ifdef DBG
             InterlockedDecrement((LONG volatile *)&adaptExt->inqueue_cnt);
 #endif
             for (le = element->srb_list.Flink; le != &element->srb_list && !bFound; le = le->Flink)
             {
-                pblk_req req = CONTAINING_RECORD(le, blk_req, list_entry);
+                req = CONTAINING_RECORD(le, blk_req, list_entry);
 
                 Srb = (PSRB_TYPE)req->req;
                 srbExt = SRB_EXTENSION(Srb);
@@ -2471,7 +2744,7 @@ VOID VioStorCompleteRequest(IN PVOID DeviceExtension, IN ULONG MessageID, IN BOO
                 // the Code Analysis and provide it with this information
                 // in order to avoid false-positive warnings.
                 _Analysis_assume_(srbExt != NULL);
-                if (srbExt->id == srbId)
+                if (req->id == srbId)
                 {
                     RemoveEntryList(le);
                     bFound = TRUE;
@@ -2537,9 +2810,21 @@ VOID VioStorCompleteRequest(IN PVOID DeviceExtension, IN ULONG MessageID, IN BOO
             }
             if (bFound && Srb)
             {
+                PVIOSTOR_SPLIT_CHILD splitChild = NULL;
+
                 /* Copy the tiny device-written status under the queue lock, but
                  * defer large read copy-back and request completion until after
                  * the lock is released. */
+                if (VioStorIsSplitChild(srbExt, req, &splitChild))
+                {
+                    if (splitChild->bounceCtl)
+                    {
+                        splitChild->vbr.status = *((u8 *)((PUCHAR)splitChild->bounceCtl + BOUNCE_CTL_STATUS_OFFSET));
+                    }
+                    InsertTailList(&completeList, &splitChild->vbr.list_entry);
+                    continue;
+                }
+
                 if (srbExt->bounceCtl)
                 {
                     srbExt->vbr.status = *((u8 *)((PUCHAR)srbExt->bounceCtl + BOUNCE_CTL_STATUS_OFFSET));
@@ -2577,7 +2862,20 @@ VOID VioStorCompleteRequest(IN PVOID DeviceExtension, IN ULONG MessageID, IN BOO
         completeEntry = RemoveHeadList(&completeList);
         req = CONTAINING_RECORD(completeEntry, blk_req, list_entry);
         Srb = (PSRB_TYPE)req->req;
-        CompleteReadWriteRequestUnlocked(DeviceExtension, Srb);
+        if (Srb)
+        {
+            PSRB_EXTENSION srbExt = SRB_EXTENSION(Srb);
+            PVIOSTOR_SPLIT_CHILD splitChild = NULL;
+
+            if (srbExt && VioStorIsSplitChild(srbExt, req, &splitChild))
+            {
+                VioStorCompleteSplitChildUnlocked(DeviceExtension, Srb, splitChild);
+            }
+            else
+            {
+                CompleteReadWriteRequestUnlocked(DeviceExtension, Srb);
+            }
+        }
     }
 
     RhelDbgPrint(TRACE_LEVEL_VERBOSE, " <--- MessageID 0x%x\n", MessageID);

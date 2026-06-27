@@ -99,6 +99,9 @@ typedef struct VirtIOBufferDescriptor VIO_SG, *PVIO_SG;
 /* Keep advertised SRB transfers below the 1MiB boundary where DroidVM's
  * restricted-DMA virtio-blk path can fall back to watchdog-paced completion. */
 #define VIOSTOR_MAX_TRANSFER_LENGTH_CAP    (960 * 1024)
+#define VIOSTOR_SPLIT_CHILD_LENGTH         (512 * 1024)
+#define VIOSTOR_SPLIT_MAX_CHILDREN         2
+#define VIOSTOR_SPLIT_MAX_SG               ((VIOSTOR_SPLIT_CHILD_LENGTH / PAGE_SIZE) + 2)
 
 #define VIOBLK_POOL_TAG                    'BoiV'
 
@@ -194,6 +197,7 @@ typedef struct virtio_blk_req
 {
     LIST_ENTRY list_entry;
     PVOID req;
+    ULONG_PTR id;
     blk_outhdr out_hdr;
     u8 status;
 } blk_req, *pblk_req;
@@ -303,6 +307,19 @@ typedef struct _VRING_DESC_ALIAS
     } u;
 } VRING_DESC_ALIAS;
 
+typedef struct _VIOSTOR_SPLIT_CHILD
+{
+    blk_req vbr;
+    ULONG out;
+    ULONG in;
+    VIO_SG sg[VIOSTOR_SPLIT_MAX_SG];
+    PVOID bounceCtl;
+    PVOID originalDataVA;
+    ULONG bounceDataChunkCount;
+    ULONG dataOffset;
+    ULONG dataLength;
+} VIOSTOR_SPLIT_CHILD, *PVIOSTOR_SPLIT_CHILD;
+
 typedef struct _SRB_EXTENSION
 {
     blk_req vbr;
@@ -318,6 +335,11 @@ typedef struct _SRB_EXTENSION
     PVOID bounceCtl;            /* Control slot VA in rdmapool, NULL if not bouncing */
     PVOID originalDataVA;       /* Original data buffer VA for read copy-back */
     ULONG bounceDataChunkCount; /* Number of contiguous data chunks allocated from bounce pool */
+    BOOLEAN split;
+    ULONG splitChildCount;
+    LONG splitRemaining;
+    LONG splitStatus;
+    VIOSTOR_SPLIT_CHILD splitChildren[VIOSTOR_SPLIT_MAX_CHILDREN];
 } SRB_EXTENSION, *PSRB_EXTENSION;
 
 BOOLEAN
