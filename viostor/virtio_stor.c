@@ -240,7 +240,7 @@ static BOOLEAN VioStorPrepareSplitReadWrite(IN PVOID DeviceExtension, IN PSRB_TY
         return FALSE;
     }
 
-    sysAddrStatus = StorPortGetSystemAddress(DeviceExtension, Srb, &dataVA);
+    sysAddrStatus = StorPortGetSystemAddress(DeviceExtension, (PSCSI_REQUEST_BLOCK)Srb, &dataVA);
     if (sysAddrStatus != STOR_STATUS_SUCCESS || dataVA == NULL)
     {
         RhelDbgPrint(TRACE_LEVEL_ERROR, " Split: StorPortGetSystemAddress failed 0x%x\n", sysAddrStatus);
