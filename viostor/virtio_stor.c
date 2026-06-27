@@ -2398,10 +2398,7 @@ static VOID CompleteReadWriteRequestUnlocked(IN PVOID DeviceExtension, IN PSRB_T
     }
 
     srbStatus = DeviceToSrbStatus(srbExt->vbr.status);
-    RhelDbgPrint(TRACE_LEVEL_VERBOSE,
-                 " srb %p, QueueNumber %lu.\n",
-                 Srb,
-                 srbExt->queue_number);
+    RhelDbgPrint(TRACE_LEVEL_VERBOSE, " srb %p, QueueNumber %lu.\n", Srb, srbExt->queue_number);
     CompleteRequestWithStatus(DeviceExtension, Srb, srbStatus);
 }
 
