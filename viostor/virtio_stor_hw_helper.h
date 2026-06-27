@@ -156,6 +156,11 @@ VOID VioStorCompleteRequest(IN PVOID DeviceExtension, IN ULONG MessageID, IN BOO
  * submit paths so a missed completion IRQ is reaped within VIOSTOR_POLL_INTERVAL_US. */
 VOID VioStorArmCompletionPoll(IN PVOID DeviceExtension);
 
+/* Inline busy-poll of a queue's used ring after submit, at low queue depth, so a
+ * completion the hypervisor drops on an idle vCPU is reaped in microseconds
+ * instead of waiting for the ~250ms watchdog. See virtio_stor.h busy-poll block. */
+VOID VioStorBusyPollComplete(IN PVOID DeviceExtension, IN ULONG MessageID, IN ULONG QueueNumber);
+
 PVOID
 VioStorPoolAlloc(IN PVOID DeviceExtension, IN SIZE_T size);
 

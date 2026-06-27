@@ -2970,6 +2970,65 @@ VOID VioStorCompletionPoll(IN PVOID DeviceExtension, IN PVOID Context)
     }
 }
 
+/*
+ * Inline busy-poll of one queue's used ring from the submit path.
+ *
+ * Called right after virtqueue_notify when the queue is at low depth. Spins
+ * draining the used ring (via VioStorCompleteRequest, exactly like the IRQ/DPC
+ * and timer paths) until the queue empties or the budget elapses, so a request
+ * whose completion interrupt the hypervisor drops on an idle vCPU is reaped in
+ * microseconds instead of waiting for the ~250ms StorPort watchdog.
+ *
+ * Safe at DISPATCH_LEVEL: VioStorCompleteRequest takes and releases the queue
+ * lock itself each call, and StorPort already supports completing requests from
+ * the StartIo/submit context (see STOR_PERF_OPTIMIZE_FOR_COMPLETION_DURING_STARTIO).
+ */
+VOID VioStorBusyPollComplete(IN PVOID DeviceExtension, IN ULONG MessageID, IN ULONG QueueNumber)
+{
+#if VIOSTOR_BUSYPOLL_ENABLE
+    PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
+    PREQUEST_LIST element = &adaptExt->processing_srbs[QueueNumber];
+    ULONG spins = VIOSTOR_BUSYPOLL_BUDGET_US / VIOSTOR_BUSYPOLL_STALL_US;
+    ULONG i;
+
+    /* Crashdump/hibernate runs its own synchronous polled completion loop and is
+     * not a throughput path; leave it on the existing mechanism. */
+    if (adaptExt->dump_mode)
+    {
+        return;
+    }
+
+    /* High queue depth: the vCPU is already busy and sees completions via the
+     * normal path; spinning would just burn cycles the workload could use. */
+    if (element->srb_cnt > VIOSTOR_BUSYPOLL_MAX_INFLIGHT)
+    {
+        return;
+    }
+
+    for (i = 0; i < spins; i++)
+    {
+        /* Drain whatever the device has published so far. This completes our
+         * request (and any sibling) as soon as it lands in the used ring. */
+        VioStorCompleteRequest(DeviceExtension, MessageID, FALSE);
+
+        /* srb_cnt is a plain read of the per-queue counter; at low depth it
+         * reaching zero means our request(s) are done. A request that another
+         * CPU submits into this queue mid-spin keeps it non-zero, but the budget
+         * still bounds us and that case is not the idle-vCPU stall we target. */
+        if (element->srb_cnt == 0)
+        {
+            break;
+        }
+
+        StorPortStallExecution(VIOSTOR_BUSYPOLL_STALL_US);
+    }
+#else
+    UNREFERENCED_PARAMETER(DeviceExtension);
+    UNREFERENCED_PARAMETER(MessageID);
+    UNREFERENCED_PARAMETER(QueueNumber);
+#endif
+}
+
 VOID LogError(IN PVOID DeviceExtension, IN ULONG ErrorCode, IN ULONG UniqueId)
 {
     STOR_LOG_EVENT_DETAILS logEvent;

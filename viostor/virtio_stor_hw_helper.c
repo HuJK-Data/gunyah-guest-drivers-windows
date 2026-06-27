@@ -215,6 +215,10 @@ static BOOLEAN RhelDoSplitReadWrite(PVOID DeviceExtension, PSRB_TYPE Srb)
     {
         virtqueue_notify(vq);
         VioStorArmCompletionPoll(DeviceExtension);
+
+        /* Large transfers split into children land here and are exactly the
+         * low-depth sequential case; spin-drain so they are not watchdog-paced. */
+        VioStorBusyPollComplete(DeviceExtension, MessageId, QueueNumber);
     }
     if (busy)
     {
@@ -368,6 +372,15 @@ RhelDoFlush(PVOID DeviceExtension, PSRB_TYPE Srb, BOOLEAN resend, BOOLEAN bIsr)
     {
         virtqueue_notify(vq);
         VioStorArmCompletionPoll(DeviceExtension);
+
+        /* Only on the normal submit path: when resend is set we were called from
+         * the FUA completion drain with the queue lock already held, so draining
+         * again here would re-enter the lock. A sync (FUA/flush) write at low
+         * depth is otherwise exactly the latency-sensitive case to spin for. */
+        if (!resend)
+        {
+            VioStorBusyPollComplete(DeviceExtension, MessageId, QueueNumber);
+        }
     }
 
     return result;
@@ -464,6 +477,11 @@ RhelDoReadWrite(PVOID DeviceExtension, PSRB_TYPE Srb)
     if (result)
     {
         VioStorArmCompletionPoll(DeviceExtension);
+
+        /* At low queue depth the vCPU would now go idle and never see the
+         * completion until the watchdog. Spin-drain the used ring instead so the
+         * request is reaped in microseconds. */
+        VioStorBusyPollComplete(DeviceExtension, MessageId, QueueNumber);
     }
 
     if (adaptExt->num_queues > 1)

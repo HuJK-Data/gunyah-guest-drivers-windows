@@ -110,6 +110,39 @@ typedef struct VirtIOBufferDescriptor VIO_SG, *PVIO_SG;
  * completion interrupt that the hypervisor failed to deliver to an idle vCPU). */
 #define VIOSTOR_POLL_INTERVAL_US           1000
 
+/*
+ * Inline busy-poll on the submit path.
+ *
+ * On this hypervisor a completion interrupt is not delivered to an idle vCPU,
+ * and the StorPort timer that backs the poll fallback (VioStorCompletionPoll)
+ * also does not fire promptly once the vCPU has halted (WFI). At low queue
+ * depth — e.g. CrystalDiskMark SEQ Q1 or any single-threaded sequential stream —
+ * the vCPU goes idle right after submitting, so each request is reaped only by
+ * the ~250ms StorPort watchdog. That caps a ~960KB transfer at ~4-5 MB/s even
+ * though random Q32 (which keeps the vCPU busy) reaches full speed.
+ *
+ * The fix that does not depend on the peer waking us: after notifying the
+ * device, do NOT let the vCPU halt. Spin-drain the used ring directly (the
+ * device publishes completions to shared memory regardless of interrupts) until
+ * our request is reaped or a bounded budget elapses. This converts the idle
+ * wait into an active wait, so the completion is observed in microseconds.
+ *
+ * Engaged only when few requests are in flight: at high queue depth the vCPU is
+ * already busy submitting/draining and sees completions promptly, so spinning
+ * would just waste cycles. At low queue depth the vCPU would otherwise be idle,
+ * so the spin costs nothing the workload could have used.
+ */
+#define VIOSTOR_BUSYPOLL_ENABLE            1
+/* Only busy-poll when at most this many requests are outstanding on the queue
+ * (counts the just-submitted request, including each split child). */
+#define VIOSTOR_BUSYPOLL_MAX_INFLIGHT      4
+/* Total spin budget per submit, microseconds. Bounds DISPATCH_LEVEL spinning;
+ * if the device is slower than this the request falls back to the poll timer /
+ * IRQ / watchdog as before. */
+#define VIOSTOR_BUSYPOLL_BUDGET_US         2000
+/* Pause between drain attempts, microseconds. */
+#define VIOSTOR_BUSYPOLL_STALL_US          4
+
 #pragma pack(1)
 typedef struct virtio_blk_config
 {
