@@ -217,8 +217,9 @@ static BOOLEAN RhelDoSplitReadWrite(PVOID DeviceExtension, PSRB_TYPE Srb)
         VioStorArmCompletionPoll(DeviceExtension);
 
         /* Large transfers split into children land here and are exactly the
-         * low-depth sequential case; spin-drain so they are not watchdog-paced. */
-        VioStorBusyPollComplete(DeviceExtension, MessageId, QueueNumber);
+         * low-depth sequential case; spin-drain so they are not watchdog-paced.
+         * Always above the size gate, so pass the cap as the length. */
+        VioStorBusyPollComplete(DeviceExtension, MessageId, QueueNumber, SRB_DATA_TRANSFER_LENGTH(Srb));
     }
     if (busy)
     {
@@ -372,15 +373,10 @@ RhelDoFlush(PVOID DeviceExtension, PSRB_TYPE Srb, BOOLEAN resend, BOOLEAN bIsr)
     {
         virtqueue_notify(vq);
         VioStorArmCompletionPoll(DeviceExtension);
-
-        /* Only on the normal submit path: when resend is set we were called from
-         * the FUA completion drain with the queue lock already held, so draining
-         * again here would re-enter the lock. A sync (FUA/flush) write at low
-         * depth is otherwise exactly the latency-sensitive case to spin for. */
-        if (!resend)
-        {
-            VioStorBusyPollComplete(DeviceExtension, MessageId, QueueNumber);
-        }
+        /* No inline busy-poll for flush: it carries no data (would fail the size
+         * gate anyway), and under write-through it fires once per write, so
+         * draining it inline would serialize an otherwise deep write stream. The
+         * preceding data I/O's busy-poll already keeps the vCPU warm. */
     }
 
     return result;
@@ -480,8 +476,8 @@ RhelDoReadWrite(PVOID DeviceExtension, PSRB_TYPE Srb)
 
         /* At low queue depth the vCPU would now go idle and never see the
          * completion until the watchdog. Spin-drain the used ring instead so the
-         * request is reaped in microseconds. */
-        VioStorBusyPollComplete(DeviceExtension, MessageId, QueueNumber);
+         * request is reaped in microseconds (large transfers only). */
+        VioStorBusyPollComplete(DeviceExtension, MessageId, QueueNumber, SRB_DATA_TRANSFER_LENGTH(Srb));
     }
 
     if (adaptExt->num_queues > 1)

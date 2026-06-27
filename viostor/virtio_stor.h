@@ -131,11 +131,23 @@ typedef struct VirtIOBufferDescriptor VIO_SG, *PVIO_SG;
  * already busy submitting/draining and sees completions promptly, so spinning
  * would just waste cycles. At low queue depth the vCPU would otherwise be idle,
  * so the spin costs nothing the workload could have used.
+ *
+ * IMPORTANT — only for large (sequential) transfers. StorPort calls StartIo
+ * serially, so draining to completion inside the submit path prevents the queue
+ * from ever building depth: every submit would see a near-empty queue, busy-poll,
+ * and complete before the next StartIo, collapsing a deep small-I/O workload to
+ * QD1. Small-block workloads (e.g. 4K random) are run at high queue depth where
+ * interrupts already work, so they must NOT busy-poll. Gate on transfer size:
+ * the idle-vCPU stall only meaningfully caps throughput for big per-I/O payloads
+ * (the classic sequential pattern), which is exactly where we want to spin.
  */
 #define VIOSTOR_BUSYPOLL_ENABLE            1
 /* Only busy-poll when at most this many requests are outstanding on the queue
  * (counts the just-submitted request, including each split child). */
 #define VIOSTOR_BUSYPOLL_MAX_INFLIGHT      4
+/* Only busy-poll transfers at least this large. Below this, skip so high-QD
+ * small-I/O concurrency is preserved (see the serialization note above). */
+#define VIOSTOR_BUSYPOLL_MIN_BYTES         (64 * 1024)
 /* Total spin budget per submit, microseconds. Bounds DISPATCH_LEVEL spinning;
  * if the device is slower than this the request falls back to the poll timer /
  * IRQ / watchdog as before. */

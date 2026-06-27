@@ -2983,7 +2983,7 @@ VOID VioStorCompletionPoll(IN PVOID DeviceExtension, IN PVOID Context)
  * lock itself each call, and StorPort already supports completing requests from
  * the StartIo/submit context (see STOR_PERF_OPTIMIZE_FOR_COMPLETION_DURING_STARTIO).
  */
-VOID VioStorBusyPollComplete(IN PVOID DeviceExtension, IN ULONG MessageID, IN ULONG QueueNumber)
+VOID VioStorBusyPollComplete(IN PVOID DeviceExtension, IN ULONG MessageID, IN ULONG QueueNumber, IN ULONG DataLen)
 {
 #if VIOSTOR_BUSYPOLL_ENABLE
     PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
@@ -2994,6 +2994,14 @@ VOID VioStorBusyPollComplete(IN PVOID DeviceExtension, IN ULONG MessageID, IN UL
     /* Crashdump/hibernate runs its own synchronous polled completion loop and is
      * not a throughput path; leave it on the existing mechanism. */
     if (adaptExt->dump_mode)
+    {
+        return;
+    }
+
+    /* Small transfers run at high queue depth where interrupts already work;
+     * draining them inline would serialize the queue to QD1. Only spin for large
+     * (sequential) transfers, which is where the idle-vCPU stall caps throughput. */
+    if (DataLen < VIOSTOR_BUSYPOLL_MIN_BYTES)
     {
         return;
     }
