@@ -1,4 +1,4 @@
-﻿/*
+/*
  * This file contains viostor StorPort(ScsiPort) miniport driver
  *
  * Copyright (c) 2008-2017 Red Hat, Inc.
@@ -52,7 +52,6 @@ HW_BUILDIO VirtIoBuildIo;
 HW_DPC_ROUTINE CompleteDpcRoutine;
 HW_MESSAGE_SIGNALED_INTERRUPT_ROUTINE VirtIoMSInterruptRoutine;
 HW_PASSIVE_INITIALIZE_ROUTINE VirtIoPassiveInitializeRoutine;
-HW_TIMER_EX VioStorCompletionPoll;
 
 extern int vring_add_buf_stor(IN struct virtqueue *_vq,
                               IN struct VirtIOBufferDescriptor sg[],
@@ -72,8 +71,6 @@ VirtIoBuildIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb);
 VOID CompleteDpcRoutine(IN PSTOR_DPC Dpc, IN PVOID Context, IN PVOID SystemArgument1, IN PVOID SystemArgument2);
 BOOLEAN
 VirtIoMSInterruptRoutine(IN PVOID DeviceExtension, IN ULONG MessageID);
-
-VOID VioStorDiagLog(IN PVOID DeviceExtension);
 
 BOOLEAN
 VirtIoStartIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb);
@@ -124,251 +121,6 @@ CompleteDPC(IN PVOID DeviceExtension, IN ULONG MessageID);
 UCHAR FirmwareRequest(IN PVOID DeviceExtension, IN PSRB_TYPE Srb);
 
 VOID ReportDeviceIdentifier(IN PVOID DeviceExtension, IN PSRB_TYPE Srb);
-
-UCHAR DeviceToSrbStatus(UCHAR status);
-
-static VOID VioStorCleanupSplitChildren(IN PADAPTER_EXTENSION adaptExt, IN PSRB_EXTENSION srbExt)
-{
-    ULONG i;
-
-    for (i = 0; i < srbExt->splitChildCount && i < VIOSTOR_SPLIT_MAX_CHILDREN; i++)
-    {
-        BOUNCE_CLEANUP_SPLIT_CHILD(adaptExt, &srbExt->splitChildren[i]);
-    }
-}
-
-static BOOLEAN VioStorIsSplitChild(IN PSRB_EXTENSION srbExt, IN pblk_req req, OUT PVIOSTOR_SPLIT_CHILD *child)
-{
-    ULONG i;
-
-    if (!srbExt->split || req == &srbExt->vbr)
-    {
-        return FALSE;
-    }
-
-    for (i = 0; i < srbExt->splitChildCount && i < VIOSTOR_SPLIT_MAX_CHILDREN; i++)
-    {
-        if (req == &srbExt->splitChildren[i].vbr)
-        {
-            if (child)
-            {
-                *child = &srbExt->splitChildren[i];
-            }
-            return TRUE;
-        }
-    }
-
-    return FALSE;
-}
-
-static VOID VioStorCompleteSplitParentUnlocked(IN PVOID DeviceExtension, IN PSRB_TYPE Srb, IN UCHAR status)
-{
-    PSRB_EXTENSION srbExt = SRB_EXTENSION(Srb);
-
-    srbExt->split = FALSE;
-    srbExt->originalDataVA = NULL;
-
-    if (status == SRB_STATUS_SUCCESS && srbExt->fua && (SRB_FLAGS(Srb) & SRB_FLAGS_DATA_OUT))
-    {
-        srbExt->fua = FALSE;
-        SRB_SET_SRB_STATUS(Srb, SRB_STATUS_PENDING);
-        if (RhelDoFlush(DeviceExtension, Srb, FALSE, FALSE))
-        {
-            return;
-        }
-        status = SRB_STATUS_ERROR;
-    }
-
-    CompleteRequestWithStatus(DeviceExtension, Srb, status);
-}
-
-static VOID VioStorCompleteSplitChildUnlocked(IN PVOID DeviceExtension, IN PSRB_TYPE Srb, IN PVIOSTOR_SPLIT_CHILD child)
-{
-    PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
-    PSRB_EXTENSION srbExt = SRB_EXTENSION(Srb);
-    UCHAR srbStatus;
-    LONG remaining;
-
-    if (child->bounceCtl)
-    {
-        child->vbr.status = *((u8 *)((PUCHAR)child->bounceCtl + BOUNCE_CTL_STATUS_OFFSET));
-    }
-
-    srbStatus = DeviceToSrbStatus(child->vbr.status);
-    if (srbStatus == SRB_STATUS_SUCCESS && child->vbr.out_hdr.type == VIRTIO_BLK_T_IN && child->originalDataVA != NULL)
-    {
-        SIZE_T offset = 0;
-        ULONG bIdx;
-
-        for (bIdx = 1; bIdx <= child->bounceDataChunkCount; bIdx++)
-        {
-            PVOID srcVA = BouncePAtoVA(&adaptExt->bounce, child->sg[bIdx].physAddr);
-            RtlCopyMemory((PUCHAR)child->originalDataVA + child->dataOffset + offset, srcVA, child->sg[bIdx].length);
-            offset += child->sg[bIdx].length;
-        }
-    }
-
-    BOUNCE_CLEANUP_SPLIT_CHILD(adaptExt, child);
-
-    if (srbStatus != SRB_STATUS_SUCCESS)
-    {
-        InterlockedCompareExchange((LONG volatile *)&srbExt->splitStatus, srbStatus, SRB_STATUS_SUCCESS);
-    }
-
-    remaining = InterlockedDecrement((LONG volatile *)&srbExt->splitRemaining);
-    if (remaining == 0)
-    {
-        UCHAR finalStatus = (UCHAR)srbExt->splitStatus;
-
-        VioStorCompleteSplitParentUnlocked(DeviceExtension, Srb, finalStatus);
-    }
-}
-
-static BOOLEAN VioStorPrepareSplitReadWrite(IN PVOID DeviceExtension, IN PSRB_TYPE Srb, IN ULONGLONG lba)
-{
-    PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
-    PSRB_EXTENSION srbExt = SRB_EXTENSION(Srb);
-    ULONG totalDataLen = SRB_DATA_TRANSFER_LENGTH(Srb);
-    BOOLEAN isWrite = !!(SRB_FLAGS(Srb) & SRB_FLAGS_DATA_OUT);
-    ULONG childCount;
-    ULONG childIndex;
-    PVOID dataVA = NULL;
-    ULONG sysAddrStatus;
-
-    if (!adaptExt->rdmaPoolActive || !adaptExt->bounce.Initialized || totalDataLen <= VIOSTOR_MAX_TRANSFER_LENGTH_CAP ||
-        totalDataLen > VIOSTOR_SPLIT_MAX_TRANSFER_LENGTH || (totalDataLen & (SECTOR_SIZE - 1)) != 0)
-    {
-        return FALSE;
-    }
-
-    sysAddrStatus = StorPortGetSystemAddress(DeviceExtension, (PSCSI_REQUEST_BLOCK)Srb, &dataVA);
-    if (sysAddrStatus != STOR_STATUS_SUCCESS || dataVA == NULL)
-    {
-        RhelDbgPrint(TRACE_LEVEL_ERROR, " Split: StorPortGetSystemAddress failed 0x%x\n", sysAddrStatus);
-        CompleteRequestWithStatus(DeviceExtension, Srb, SRB_STATUS_ERROR);
-        return FALSE;
-    }
-
-    childCount = (totalDataLen + VIOSTOR_SPLIT_CHILD_LENGTH - 1) / VIOSTOR_SPLIT_CHILD_LENGTH;
-    if (childCount == 0 || childCount > VIOSTOR_SPLIT_MAX_CHILDREN)
-    {
-        return FALSE;
-    }
-
-    srbExt->split = TRUE;
-    srbExt->splitChildCount = childCount;
-    srbExt->splitRemaining = childCount;
-    srbExt->splitStatus = SRB_STATUS_SUCCESS;
-    srbExt->originalDataVA = dataVA;
-    srbExt->bounceCtl = NULL;
-    srbExt->bounceDataChunkCount = 0;
-
-    for (childIndex = 0; childIndex < childCount; childIndex++)
-    {
-        PVIOSTOR_SPLIT_CHILD child = &srbExt->splitChildren[childIndex];
-        ULONG childOffset = childIndex * VIOSTOR_SPLIT_CHILD_LENGTH;
-        ULONG childLen = min(VIOSTOR_SPLIT_CHILD_LENGTH, totalDataLen - childOffset);
-        ULONG newSgIdx = 1;
-        ULONG dataOffset = 0;
-        ULONG requiredSg;
-
-        RtlZeroMemory(child, sizeof(*child));
-
-        if (adaptExt->bounce.DataChunkSize == 0)
-        {
-            RhelDbgPrint(TRACE_LEVEL_ERROR, " Split: invalid zero data chunk size\n");
-            VioStorCleanupSplitChildren(adaptExt, srbExt);
-            srbExt->split = FALSE;
-            CompleteRequestWithStatus(DeviceExtension, Srb, SRB_STATUS_ERROR);
-            return FALSE;
-        }
-
-        requiredSg = ((childLen + adaptExt->bounce.DataChunkSize - 1) / adaptExt->bounce.DataChunkSize) + 2;
-        if (requiredSg > VIOSTOR_SPLIT_MAX_SG)
-        {
-            RhelDbgPrint(TRACE_LEVEL_ERROR, " Split: too many SG entries %lu\n", requiredSg);
-            VioStorCleanupSplitChildren(adaptExt, srbExt);
-            srbExt->split = FALSE;
-            CompleteRequestWithStatus(DeviceExtension, Srb, SRB_STATUS_BAD_SRB_BLOCK_LENGTH);
-            return FALSE;
-        }
-
-        child->bounceCtl = BounceAllocCtl(&adaptExt->bounce);
-        if (!child->bounceCtl)
-        {
-            RhelDbgPrint(TRACE_LEVEL_ERROR, " Split: no control slots available\n");
-            VioStorCleanupSplitChildren(adaptExt, srbExt);
-            srbExt->split = FALSE;
-            CompleteRequestWithStatus(DeviceExtension, Srb, SRB_STATUS_BUSY);
-            return FALSE;
-        }
-
-        child->originalDataVA = dataVA;
-        child->dataOffset = childOffset;
-        child->dataLength = childLen;
-        child->vbr.req = Srb;
-        child->vbr.out_hdr.type = isWrite ? VIRTIO_BLK_T_OUT : VIRTIO_BLK_T_IN;
-        child->vbr.out_hdr.ioprio = 0;
-        child->vbr.out_hdr.sector = lba + (childOffset / SECTOR_SIZE);
-
-        RtlCopyMemory((PUCHAR)child->bounceCtl + BOUNCE_CTL_OUTHDR_OFFSET,
-                      &child->vbr.out_hdr,
-                      sizeof(child->vbr.out_hdr));
-
-        child->sg[0].physAddr = BounceVAtoPA(&adaptExt->bounce, (PUCHAR)child->bounceCtl + BOUNCE_CTL_OUTHDR_OFFSET);
-        child->sg[0].length = sizeof(child->vbr.out_hdr);
-
-        while (dataOffset < childLen)
-        {
-            PVOID bounceChunk = BounceAllocDataChunk(&adaptExt->bounce);
-            ULONG chunkLen;
-
-            if (!bounceChunk)
-            {
-                RhelDbgPrint(TRACE_LEVEL_ERROR, " Split: no data chunks\n");
-                VioStorCleanupSplitChildren(adaptExt, srbExt);
-                srbExt->split = FALSE;
-                CompleteRequestWithStatus(DeviceExtension, Srb, SRB_STATUS_BUSY);
-                return FALSE;
-            }
-
-            child->bounceDataChunkCount++;
-            chunkLen = min(adaptExt->bounce.DataChunkSize, childLen - dataOffset);
-            if (isWrite)
-            {
-                RtlCopyMemory(bounceChunk, (PUCHAR)dataVA + childOffset + dataOffset, chunkLen);
-            }
-
-            child->sg[newSgIdx].physAddr = BounceVAtoPA(&adaptExt->bounce, bounceChunk);
-            child->sg[newSgIdx].length = chunkLen;
-            newSgIdx++;
-            dataOffset += chunkLen;
-        }
-
-        child->sg[newSgIdx].physAddr = BounceVAtoPA(&adaptExt->bounce,
-                                                    (PUCHAR)child->bounceCtl + BOUNCE_CTL_STATUS_OFFSET);
-        child->sg[newSgIdx].length = sizeof(child->vbr.status);
-
-        if (isWrite)
-        {
-            child->out = newSgIdx;
-            child->in = 1;
-        }
-        else
-        {
-            child->out = 1;
-            child->in = newSgIdx;
-        }
-    }
-
-    RhelDbgPrint(TRACE_LEVEL_INFORMATION,
-                 " Split: srb %p len=%lu children=%lu child_len=%lu\n",
-                 Srb,
-                 totalDataLen,
-                 childCount,
-                 VIOSTOR_SPLIT_CHILD_LENGTH);
-    return TRUE;
-}
 
 #ifdef EVENT_TRACING
 VOID WppCleanupRoutine(PVOID arg1)
@@ -681,11 +433,6 @@ VirtIoFindAdapter(IN PVOID DeviceExtension,
     }
 
     ConfigInfo->MaximumTransferLength = ConfigInfo->NumberOfPhysicalBreaks * PAGE_SIZE;
-    if (ConfigInfo->MaximumTransferLength > VIOSTOR_MAX_TRANSFER_LENGTH_CAP)
-    {
-        ConfigInfo->MaximumTransferLength = VIOSTOR_MAX_TRANSFER_LENGTH_CAP;
-        ConfigInfo->NumberOfPhysicalBreaks = ConfigInfo->MaximumTransferLength / PAGE_SIZE;
-    }
     ConfigInfo->NumberOfPhysicalBreaks++;
     adaptExt->max_tx_length = ConfigInfo->MaximumTransferLength;
 
@@ -772,6 +519,22 @@ VirtIoFindAdapter(IN PVOID DeviceExtension,
     {
         adaptExt->poolAllocationVa = (PVOID)((ULONG_PTR)adaptExt->pageAllocationVa + adaptExt->pageAllocationSize);
     }
+
+    /*
+     * Restricted DMA pool (Gunyah protected VM): redirect the vrings into
+     * rdmapool (device-visible memory) and stage all I/O through bounce buffers.
+     * Use direct descriptors and a fixed large-chunk transfer size; completions
+     * are reaped by the poll thread plus the ISR. Driver-internal pool memory
+     * (poolAllocationVa) stays in the uncached extension. No-op if rdmapool is
+     * absent (normal KVM path).
+     */
+    if (NT_SUCCESS(VioStorConnectRdmaPool(DeviceExtension)))
+    {
+        adaptExt->indirect = FALSE;
+        ConfigInfo->MaximumTransferLength = BOUNCE_DATA_CHUNK_SIZE;
+        ConfigInfo->NumberOfPhysicalBreaks = (BOUNCE_DATA_CHUNK_SIZE / PAGE_SIZE) + 1;
+        adaptExt->max_tx_length = ConfigInfo->MaximumTransferLength;
+    }
     RhelDbgPrint(TRACE_LEVEL_INFORMATION,
                  " Page-aligned area at %p, size = %d\n",
                  adaptExt->pageAllocationVa,
@@ -780,9 +543,6 @@ VirtIoFindAdapter(IN PVOID DeviceExtension,
                  " Pool area at %p, size = %d\n",
                  adaptExt->poolAllocationVa,
                  adaptExt->poolAllocationSize);
-
-    VioStorConnectRdmaPool(adaptExt);
-
     RhelDbgPrint(TRACE_LEVEL_INFORMATION, " pmsg_affinity = %p\n", adaptExt->pmsg_affinity);
     if (!adaptExt->dump_mode && (adaptExt->num_queues > 1) && (adaptExt->pmsg_affinity == NULL))
     {
@@ -809,15 +569,24 @@ VirtIoPassiveInitializeRoutine(IN PVOID DeviceExtension)
     }
     adaptExt->dpc_ok = TRUE;
 
-    /* One-shot timer used as the completion-poll fallback (re-armed by itself
-     * while requests are outstanding). Failure is non-fatal: completions then
-     * rely solely on interrupts (with the ~250ms watchdog as last resort). */
-    if (adaptExt->completionPollTimer == NULL)
+    /*
+     * Restricted DMA pool path: carve the bounce allocator out of the rdmapool
+     * region left after the vrings, and start the completion poll thread. Both
+     * require PASSIVE_LEVEL, which is why they live here and not in HwInitialize.
+     */
+    if (adaptExt->rdmaPoolActive)
     {
-        adaptExt->pollArmed = 0;
-        StorPortInitializeTimer(DeviceExtension, &adaptExt->completionPollTimer);
+        if (!NT_SUCCESS(VioStorBounceInit(DeviceExtension)))
+        {
+            RhelDbgPrint(TRACE_LEVEL_FATAL, " bounce init failed\n");
+            return FALSE;
+        }
+        if (!NT_SUCCESS(VioStorStartPollThread(DeviceExtension)))
+        {
+            RhelDbgPrint(TRACE_LEVEL_FATAL, " poll thread start failed\n");
+            return FALSE;
+        }
     }
-
     return TRUE;
 }
 
@@ -996,61 +765,6 @@ VirtIoHwInitialize(IN PVOID DeviceExtension)
         return ret;
     }
 
-    /* Initialize bounce buffer allocator from remaining rdmapool space */
-    if (adaptExt->rdmaPoolActive)
-    {
-        PUCHAR bounceBase = (PUCHAR)adaptExt->pageAllocationVa + adaptExt->pageOffset;
-        SIZE_T bounceSize;
-        PHYSICAL_ADDRESS bouncePA;
-        NTSTATUS status;
-        ULONG chunkSize;
-
-        bounceSize = adaptExt->pageAllocationSize - adaptExt->pageOffset;
-        bouncePA.QuadPart = adaptExt->rdmaPoolBasePA.QuadPart + adaptExt->pageOffset;
-
-        /* One bounce chunk must fit in a single descriptor, so cap it to the
-         * device's size_max (size_max == 0 means unlimited). BounceInit
-         * page-aligns and clamps to the available region. */
-        chunkSize = BOUNCE_DATA_CHUNK_SIZE;
-        if (adaptExt->info.size_max > 0 && adaptExt->info.size_max < chunkSize)
-        {
-            chunkSize = adaptExt->info.size_max;
-        }
-
-        RhelDbgPrint(TRACE_LEVEL_INFORMATION,
-                     " Bounce region: VA=%p PA=0x%I64x Size=0x%Ix (after ring offset 0x%x) chunk=0x%x\n",
-                     bounceBase,
-                     bouncePA.QuadPart,
-                     bounceSize,
-                     adaptExt->pageOffset,
-                     chunkSize);
-
-        status = BounceInit(&adaptExt->bounce, bounceBase, bouncePA, bounceSize, adaptExt->queue_depth, chunkSize);
-        if (!NT_SUCCESS(status))
-        {
-            RhelDbgPrint(TRACE_LEVEL_ERROR, " BounceInit failed 0x%x, disabling rdmapool bounce\n", status);
-            adaptExt->rdmaPoolActive = FALSE;
-        }
-    }
-
-    RhelDbgPrint(TRACE_LEVEL_INFORMATION,
-                 " Perf summary: indirect=%lu event_idx=%lu flush=%lu mq=%lu queues=%lu msix=%lu config_vector=%lu "
-                 "queue_depth=%lu max_xfer=%lu rdmapool=%lu bounce=%lu ctl_slots=%lu data_chunks=%lu chunk_kb=%lu\n",
-                 (ULONG)adaptExt->indirect,
-                 (ULONG)CHECKBIT(adaptExt->features, VIRTIO_RING_F_EVENT_IDX),
-                 (ULONG)CHECKBIT(adaptExt->features, VIRTIO_BLK_F_FLUSH),
-                 (ULONG)CHECKBIT(adaptExt->features, VIRTIO_BLK_F_MQ),
-                 adaptExt->num_queues,
-                 adaptExt->msix_vectors,
-                 (ULONG)adaptExt->msix_has_config_vector,
-                 adaptExt->queue_depth,
-                 adaptExt->max_tx_length,
-                 (ULONG)adaptExt->rdmaPoolActive,
-                 (ULONG)adaptExt->bounce.Initialized,
-                 adaptExt->bounce.CtlSlotCount,
-                 adaptExt->bounce.DataChunkCount,
-                 adaptExt->bounce.DataChunkSize / 1024);
-
     memset(&adaptExt->inquiry_data, 0, sizeof(INQUIRYDATA));
 
     adaptExt->inquiry_data.ANSIVersion = 4;
@@ -1198,29 +912,6 @@ static VOID CompletePendingRequestsOnReset(IN PVOID DeviceExtension)
                 PSCSI_REQUEST_BLOCK Srb = (PSCSI_REQUEST_BLOCK)req->req;
                 if (Srb)
                 {
-                    PSRB_EXTENSION srbExt = SRB_EXTENSION((PSRB_TYPE)Srb);
-                    if (srbExt)
-                    {
-                        PVIOSTOR_SPLIT_CHILD splitChild = NULL;
-
-                        if (VioStorIsSplitChild(srbExt, req, &splitChild))
-                        {
-                            BOUNCE_CLEANUP_SPLIT_CHILD(adaptExt, splitChild);
-                            InterlockedCompareExchange((LONG volatile *)&srbExt->splitStatus,
-                                                       SRB_STATUS_BUS_RESET,
-                                                       SRB_STATUS_SUCCESS);
-                            if (InterlockedDecrement((LONG volatile *)&srbExt->splitRemaining) == 0)
-                            {
-                                srbExt->split = FALSE;
-                                SRB_SET_DATA_TRANSFER_LENGTH(Srb, 0);
-                                CompleteRequestWithStatus(DeviceExtension, (PSRB_TYPE)Srb, (UCHAR)srbExt->splitStatus);
-                            }
-                            element->srb_cnt--;
-                            continue;
-                        }
-
-                        BOUNCE_CLEANUP_SRB(adaptExt, srbExt);
-                    }
                     SRB_SET_DATA_TRANSFER_LENGTH(Srb, 0);
                     CompleteRequestWithStatus(DeviceExtension, (PSRB_TYPE)Srb, SRB_STATUS_BUS_RESET);
                     element->srb_cnt--;
@@ -1617,7 +1308,6 @@ VirtIoInterrupt(IN PVOID DeviceExtension)
     intReason = virtio_read_isr_status(&adaptExt->vdev);
     if (intReason & 0x1 || adaptExt->dump_mode)
     {
-        InterlockedIncrement(&adaptExt->dbgIsrCalls);
         if (!CompleteDPC(DeviceExtension, adaptExt->msix_has_config_vector))
         {
             VioStorCompleteRequest(DeviceExtension, adaptExt->msix_has_config_vector, TRUE);
@@ -1646,8 +1336,6 @@ VirtIoMSInterruptRoutine(IN PVOID DeviceExtension, IN ULONG MessageID)
         RhelDbgPrint(TRACE_LEVEL_ERROR, " MessageID = %d\n", MessageID);
         return FALSE;
     }
-
-    InterlockedIncrement(&adaptExt->dbgIsrCalls);
 
     if (MessageID == VIRTIO_BLK_MSIX_CONFIG_VECTOR)
     {
@@ -1729,7 +1417,6 @@ VirtIoAdapterControl(IN PVOID DeviceExtension, IN SCSI_ADAPTER_CONTROL_TYPE Cont
                 }
                 if (adaptExt->stopped)
                 {
-                    VioStorDisconnectRdmaPool(adaptExt);
                     if (adaptExt->pmsg_affinity != NULL)
                     {
                         StorPortFreePool(DeviceExtension, (PVOID)adaptExt->pmsg_affinity);
@@ -1906,6 +1593,28 @@ VirtIoBuildIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
         return FALSE;
     }
 
+    /*
+     * Restricted DMA pool: the device cannot touch the guest data pages in the
+     * SGL, so stage the entire transfer through a few large contiguous bounce
+     * chunks (out_hdr + chunks + status, all in rdmapool). No per-4KB-page
+     * descriptors, no hard splitting in the driver.
+     */
+    if (adaptExt->rdmaPoolActive)
+    {
+        srbExt->vbr.out_hdr.sector = lba;
+        srbExt->vbr.out_hdr.ioprio = 0;
+        srbExt->vbr.req = (PVOID)Srb;
+        srbExt->fua = CHECKBIT(adaptExt->features, VIRTIO_BLK_F_FLUSH) ? (cdb->CDB10.ForceUnitAccess == 1) : FALSE;
+        srbExt->vbr.out_hdr.type = (SRB_FLAGS(Srb) & SRB_FLAGS_DATA_OUT) ? VIRTIO_BLK_T_OUT : VIRTIO_BLK_T_IN;
+        if (!VioStorBounceBuild(DeviceExtension, Srb))
+        {
+            /* Pool momentarily exhausted; ask the class driver to retry. */
+            CompleteRequestWithStatus(DeviceExtension, (PSRB_TYPE)Srb, SRB_STATUS_BUSY);
+            return FALSE;
+        }
+        return TRUE;
+    }
+
     sgMaxElements = min((MAX_PHYS_SEGMENTS + 1), sgList->NumberOfElements);
 
     if (CHECKBIT(adaptExt->features, VIRTIO_BLK_F_SIZE_MAX))
@@ -1966,117 +1675,11 @@ VirtIoBuildIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
         srbExt->in = sgElement;
     }
 
-    if (adaptExt->rdmaPoolActive && adaptExt->bounce.Initialized &&
-        SRB_DATA_TRANSFER_LENGTH(Srb) > VIOSTOR_MAX_TRANSFER_LENGTH_CAP &&
-        SRB_DATA_TRANSFER_LENGTH(Srb) <= VIOSTOR_SPLIT_MAX_TRANSFER_LENGTH &&
-        (SRB_DATA_TRANSFER_LENGTH(Srb) & (SECTOR_SIZE - 1)) == 0)
-    {
-        return VioStorPrepareSplitReadWrite(DeviceExtension, (PSRB_TYPE)Srb, lba);
-    }
+    srbExt->sg[0].physAddr = StorPortGetPhysicalAddress(DeviceExtension, NULL, &srbExt->vbr.out_hdr, &dummy);
+    srbExt->sg[0].length = sizeof(srbExt->vbr.out_hdr);
 
-    /* Bounce buffer setup for restricted DMA pool */
-    if (adaptExt->rdmaPoolActive && adaptExt->bounce.Initialized)
-    {
-        PVOID ctlSlot;
-        PVOID dataVA = NULL;
-        BOOLEAN isWrite = !!(SRB_FLAGS(Srb) & SRB_FLAGS_DATA_OUT);
-        ULONG dataChunkCount = 0;
-        SIZE_T dataOffset = 0;
-        ULONG totalDataLen = SRB_DATA_TRANSFER_LENGTH(Srb);
-        ULONG newSgIdx = 1;
-        ULONG j;
-
-        ctlSlot = BounceAllocCtl(&adaptExt->bounce);
-        if (!ctlSlot)
-        {
-            RhelDbgPrint(TRACE_LEVEL_ERROR, " Bounce: no control slots available\n");
-            CompleteRequestWithStatus(DeviceExtension, (PSRB_TYPE)Srb, SRB_STATUS_BUSY);
-            return FALSE;
-        }
-        srbExt->bounceCtl = ctlSlot;
-
-        /* Copy out_hdr to bounce control slot */
-        RtlCopyMemory((PUCHAR)ctlSlot + BOUNCE_CTL_OUTHDR_OFFSET, &srbExt->vbr.out_hdr, sizeof(srbExt->vbr.out_hdr));
-
-        /* Header SG → bounce */
-        srbExt->sg[0].physAddr = BounceVAtoPA(&adaptExt->bounce, (PUCHAR)ctlSlot + BOUNCE_CTL_OUTHDR_OFFSET);
-        srbExt->sg[0].length = sizeof(srbExt->vbr.out_hdr);
-
-        /* Get system VA for data buffer copy */
-        if (totalDataLen > 0)
-        {
-            ULONG sysAddrStatus = StorPortGetSystemAddress(DeviceExtension, Srb, &dataVA);
-            if (sysAddrStatus != STOR_STATUS_SUCCESS || dataVA == NULL)
-            {
-                BounceFreeCtl(&adaptExt->bounce, ctlSlot);
-                srbExt->bounceCtl = NULL;
-                RhelDbgPrint(TRACE_LEVEL_ERROR, " Bounce: StorPortGetSystemAddress failed 0x%x\n", sysAddrStatus);
-                CompleteRequestWithStatus(DeviceExtension, (PSRB_TYPE)Srb, SRB_STATUS_ERROR);
-                return FALSE;
-            }
-        }
-        srbExt->originalDataVA = dataVA;
-
-        /* Allocate bounce buffers for data as contiguous chunks. Each chunk is
-         * physically contiguous and <= device size_max, so it becomes a single
-         * virtqueue descriptor (vs. one-descriptor-per-4KB-page before). */
-        for (dataOffset = 0; dataOffset < totalDataLen;)
-        {
-            PVOID bounceChunk = BounceAllocDataChunk(&adaptExt->bounce);
-            ULONG chunkLen;
-
-            if (!bounceChunk)
-            {
-                /* Free previously allocated data chunks */
-                for (j = 1; j <= dataChunkCount; j++)
-                {
-                    BounceFreeDataChunk(&adaptExt->bounce, BouncePAtoVA(&adaptExt->bounce, srbExt->sg[j].physAddr));
-                }
-                BounceFreeCtl(&adaptExt->bounce, ctlSlot);
-                srbExt->bounceCtl = NULL;
-                RhelDbgPrint(TRACE_LEVEL_ERROR, " Bounce: no data chunks\n");
-                CompleteRequestWithStatus(DeviceExtension, (PSRB_TYPE)Srb, SRB_STATUS_BUSY);
-                return FALSE;
-            }
-            dataChunkCount++;
-            chunkLen = min(adaptExt->bounce.DataChunkSize, totalDataLen - (ULONG)dataOffset);
-
-            if (isWrite && dataVA)
-            {
-                RtlCopyMemory(bounceChunk, (PUCHAR)dataVA + dataOffset, chunkLen);
-            }
-
-            srbExt->sg[newSgIdx].physAddr = BounceVAtoPA(&adaptExt->bounce, bounceChunk);
-            srbExt->sg[newSgIdx].length = chunkLen;
-            newSgIdx++;
-            dataOffset += chunkLen;
-        }
-        srbExt->bounceDataChunkCount = dataChunkCount;
-
-        /* Status SG → bounce */
-        srbExt->sg[newSgIdx].physAddr = BounceVAtoPA(&adaptExt->bounce, (PUCHAR)ctlSlot + BOUNCE_CTL_STATUS_OFFSET);
-        srbExt->sg[newSgIdx].length = sizeof(srbExt->vbr.status);
-
-        /* Update out/in counts to reflect bounce layout */
-        if (isWrite)
-        {
-            srbExt->out = newSgIdx; /* hdr + data chunks */
-            srbExt->in = 1;         /* status */
-        }
-        else
-        {
-            srbExt->out = 1;       /* hdr */
-            srbExt->in = newSgIdx; /* data chunks + status */
-        }
-    }
-    else
-    {
-        srbExt->sg[0].physAddr = StorPortGetPhysicalAddress(DeviceExtension, NULL, &srbExt->vbr.out_hdr, &dummy);
-        srbExt->sg[0].length = sizeof(srbExt->vbr.out_hdr);
-
-        srbExt->sg[sgElement].physAddr = StorPortGetPhysicalAddress(DeviceExtension, NULL, &srbExt->vbr.status, &dummy);
-        srbExt->sg[sgElement].length = sizeof(srbExt->vbr.status);
-    }
+    srbExt->sg[sgElement].physAddr = StorPortGetPhysicalAddress(DeviceExtension, NULL, &srbExt->vbr.status, &dummy);
+    srbExt->sg[sgElement].length = sizeof(srbExt->vbr.status);
 
     return TRUE;
 }
@@ -2653,36 +2256,6 @@ UCHAR DeviceToSrbStatus(UCHAR status)
     return SRB_STATUS_ERROR;
 }
 
-static VOID CompleteReadWriteRequestUnlocked(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
-{
-    PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
-    PSRB_EXTENSION srbExt = SRB_EXTENSION(Srb);
-    UCHAR srbStatus;
-
-    if (srbExt->bounceCtl)
-    {
-        if (srbExt->vbr.out_hdr.type == VIRTIO_BLK_T_IN && srbExt->originalDataVA != NULL &&
-            srbExt->bounceDataChunkCount > 0)
-        {
-            SIZE_T offset = 0;
-            ULONG bIdx;
-
-            for (bIdx = 1; bIdx <= srbExt->bounceDataChunkCount; bIdx++)
-            {
-                PVOID srcVA = BouncePAtoVA(&adaptExt->bounce, srbExt->sg[bIdx].physAddr);
-                RtlCopyMemory((PUCHAR)srbExt->originalDataVA + offset, srcVA, srbExt->sg[bIdx].length);
-                offset += srbExt->sg[bIdx].length;
-            }
-        }
-
-        BOUNCE_CLEANUP_SRB(adaptExt, srbExt);
-    }
-
-    srbStatus = DeviceToSrbStatus(srbExt->vbr.status);
-    RhelDbgPrint(TRACE_LEVEL_VERBOSE, " srb %p, QueueNumber %lu.\n", Srb, srbExt->queue_number);
-    CompleteRequestWithStatus(DeviceExtension, Srb, srbStatus);
-}
-
 VOID VioStorCompleteRequest(IN PVOID DeviceExtension, IN ULONG MessageID, IN BOOLEAN bIsr)
 {
     unsigned int len = 0;
@@ -2695,13 +2268,8 @@ VOID VioStorCompleteRequest(IN PVOID DeviceExtension, IN ULONG MessageID, IN BOO
     PSRB_EXTENSION srbExt = NULL;
     UCHAR srbStatus = SRB_STATUS_SUCCESS;
     PREQUEST_LIST element = NULL;
-    ULONG dbgReaped = 0;
-    LIST_ENTRY completeList;
-    PLIST_ENTRY completeEntry;
 
     RhelDbgPrint(TRACE_LEVEL_VERBOSE, " ---> MessageID 0x%x\n", MessageID);
-
-    InitializeListHead(&completeList);
 
     VioStorVQLock(DeviceExtension, MessageID, &queueLock, bIsr);
 
@@ -2732,14 +2300,13 @@ VOID VioStorCompleteRequest(IN PVOID DeviceExtension, IN ULONG MessageID, IN BOO
         while ((srbId = (ULONG_PTR)virtqueue_get_buf(vq, &len)) != 0)
         {
             PLIST_ENTRY le = NULL;
-            pblk_req req = NULL;
             BOOLEAN bFound = FALSE;
 #ifdef DBG
             InterlockedDecrement((LONG volatile *)&adaptExt->inqueue_cnt);
 #endif
             for (le = element->srb_list.Flink; le != &element->srb_list && !bFound; le = le->Flink)
             {
-                req = CONTAINING_RECORD(le, blk_req, list_entry);
+                pblk_req req = CONTAINING_RECORD(le, blk_req, list_entry);
 
                 Srb = (PSRB_TYPE)req->req;
                 srbExt = SRB_EXTENSION(Srb);
@@ -2749,12 +2316,11 @@ VOID VioStorCompleteRequest(IN PVOID DeviceExtension, IN ULONG MessageID, IN BOO
                 // the Code Analysis and provide it with this information
                 // in order to avoid false-positive warnings.
                 _Analysis_assume_(srbExt != NULL);
-                if (req->id == srbId)
+                if (srbExt->id == srbId)
                 {
                     RemoveEntryList(le);
                     bFound = TRUE;
                     element->srb_cnt--;
-                    dbgReaped++;
                     break;
                 }
             }
@@ -2764,16 +2330,17 @@ VOID VioStorCompleteRequest(IN PVOID DeviceExtension, IN ULONG MessageID, IN BOO
                 RhelDbgPrint(TRACE_LEVEL_WARNING, " No Srb to complete for ID 0x%p\n", (void *)srbId);
             }
 
+            /* Restricted DMA pool: copy reads out of the bounce chunks, latch the
+             * device status / serial, and free the bounce resources before any
+             * completion logic reads srbExt->vbr.status or adaptExt->sn. No-op for
+             * non-bounced requests. */
+            if (bFound && srbExt && srbExt->bounceCtl)
+            {
+                VioStorBounceComplete(DeviceExtension, srbExt);
+            }
+
             if (bFound && srbExt->vbr.out_hdr.type == VIRTIO_BLK_T_GET_ID)
             {
-                /* Bounce cleanup for GET_ID: copy sn and status from bounce slot */
-                if (srbExt->bounceCtl)
-                {
-                    RtlCopyMemory(adaptExt->sn, (PUCHAR)srbExt->bounceCtl + BOUNCE_CTL_SN_OFFSET, sizeof(adaptExt->sn));
-                    srbExt->vbr.status = *((u8 *)((PUCHAR)srbExt->bounceCtl + BOUNCE_CTL_STATUS_OFFSET));
-                    BounceFreeCtl(&adaptExt->bounce, srbExt->bounceCtl);
-                    srbExt->bounceCtl = NULL;
-                }
                 adaptExt->sn_ok = TRUE;
                 if (Srb)
                 {
@@ -2816,28 +2383,8 @@ VOID VioStorCompleteRequest(IN PVOID DeviceExtension, IN ULONG MessageID, IN BOO
             }
             if (bFound && Srb)
             {
-                PVIOSTOR_SPLIT_CHILD splitChild = NULL;
-
-                /* Copy the tiny device-written status under the queue lock, but
-                 * defer large read copy-back and request completion until after
-                 * the lock is released. */
-                if (VioStorIsSplitChild(srbExt, req, &splitChild))
-                {
-                    if (splitChild->bounceCtl)
-                    {
-                        splitChild->vbr.status = *((u8 *)((PUCHAR)splitChild->bounceCtl + BOUNCE_CTL_STATUS_OFFSET));
-                    }
-                    InsertTailList(&completeList, &splitChild->vbr.list_entry);
-                    continue;
-                }
-
-                if (srbExt->bounceCtl)
-                {
-                    srbExt->vbr.status = *((u8 *)((PUCHAR)srbExt->bounceCtl + BOUNCE_CTL_STATUS_OFFSET));
-                }
-
                 srbStatus = DeviceToSrbStatus(srbExt->vbr.status);
-                RhelDbgPrint(TRACE_LEVEL_VERBOSE,
+                RhelDbgPrint(TRACE_LEVEL_INFORMATION,
                              " srb %p, QueueNumber %lu, MessageId %lu.\n",
                              Srb,
                              QueueNumber,
@@ -2853,63 +2400,13 @@ VOID VioStorCompleteRequest(IN PVOID DeviceExtension, IN ULONG MessageID, IN BOO
                 }
                 else
                 {
-                    InsertTailList(&completeList, &srbExt->vbr.list_entry);
+                    CompleteRequestWithStatus(DeviceExtension, (PSRB_TYPE)Srb, srbStatus);
                 }
             }
         }
     } while (!virtqueue_enable_cb(vq));
 
     VioStorVQUnlock(DeviceExtension, MessageID, &queueLock, bIsr);
-
-    while (!IsListEmpty(&completeList))
-    {
-        pblk_req req;
-
-        completeEntry = RemoveHeadList(&completeList);
-        req = CONTAINING_RECORD(completeEntry, blk_req, list_entry);
-        Srb = (PSRB_TYPE)req->req;
-        if (Srb)
-        {
-            PSRB_EXTENSION srbExt = SRB_EXTENSION(Srb);
-            PVIOSTOR_SPLIT_CHILD splitChild = NULL;
-
-            if (srbExt && VioStorIsSplitChild(srbExt, req, &splitChild))
-            {
-                VioStorCompleteSplitChildUnlocked(DeviceExtension, Srb, splitChild);
-            }
-            else
-            {
-                CompleteReadWriteRequestUnlocked(DeviceExtension, Srb);
-            }
-        }
-    }
-
-    if (dbgReaped)
-    {
-        LONG newTotal = InterlockedAdd(&adaptExt->dbgCompletedTotal, (LONG)dbgReaped);
-        if (bIsr)
-        {
-            InterlockedAdd(&adaptExt->dbgCompletedIsr, (LONG)dbgReaped);
-        }
-        /* Dump the counters once per ~2000 completions (reliable cadence tied to
-         * I/O, unlike the self-stopping poll timer). isr ~= completed => interrupts
-         * are delivered; isr ~= 0 while completed grows => completions only reaped
-         * by poll/busy-poll (interrupt suppressed or not waking the vCPU). */
-        if ((newTotal / 64) != ((newTotal - (LONG)dbgReaped) / 64))
-        {
-            /* Direct DbgPrint (not RhelDbgPrint, which is WPP in the Release
-             * build and would need TMF/PDB to decode) so DebugView captures it
-             * as plain text. */
-            DbgPrint("VIOSTOR-DIAG isrCalls=%d completed=%d completedInIsr=%d pollFirings=%d submitPolls=%d\n",
-                     adaptExt->dbgIsrCalls,
-                     newTotal,
-                     adaptExt->dbgCompletedIsr,
-                     adaptExt->dbgPollCalls,
-                     adaptExt->dbgSubmitPollCalls);
-            /* Also emit to the System event log so it's readable over SSH. */
-            VioStorDiagLog(DeviceExtension);
-        }
-    }
 
     RhelDbgPrint(TRACE_LEVEL_VERBOSE, " <--- MessageID 0x%x\n", MessageID);
 }
@@ -2920,159 +2417,6 @@ VOID CompleteDpcRoutine(IN PSTOR_DPC Dpc, IN PVOID Context, IN PVOID SystemArgum
     ULONG MessageID = PtrToUlong(SystemArgument1);
 
     VioStorCompleteRequest(Context, MessageID, FALSE);
-}
-
-/* TRUE if any queue still has requests in flight. Lock-free approximate read of
- * the per-queue counters; only used to decide whether to keep the poll armed,
- * so an occasional stale read just costs/saves one extra ~1ms cycle. */
-static BOOLEAN VioStorHasOutstanding(PADAPTER_EXTENSION adaptExt)
-{
-    ULONG i;
-    for (i = 0; i < adaptExt->num_queues; i++)
-    {
-        if (adaptExt->processing_srbs[i].srb_cnt != 0)
-        {
-            return TRUE;
-        }
-    }
-    return FALSE;
-}
-
-VOID VioStorArmCompletionPoll(IN PVOID DeviceExtension)
-{
-    PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
-
-    /* Timer is created once at passive init (StorPortInitializeTimer requires
-     * PASSIVE_LEVEL, so it must NOT be created here on the DISPATCH submit path).
-     * If it isn't ready, skip: completions then rely on the interrupt. */
-    if (adaptExt->completionPollTimer == NULL)
-    {
-        return;
-    }
-    /* Schedule only if not already scheduled (the running timer re-arms itself
-     * while work remains). */
-    if (InterlockedCompareExchange(&adaptExt->pollArmed, 1, 0) == 0)
-    {
-        StorPortRequestTimer(DeviceExtension,
-                             adaptExt->completionPollTimer,
-                             VioStorCompletionPoll,
-                             NULL,
-                             VIOSTOR_POLL_INTERVAL_US,
-                             0);
-    }
-}
-
-/*
- * Completion-poll fallback. Drains every queue's used ring exactly like the
- * interrupt/DPC path, then re-arms itself while requests remain outstanding.
- * This bounds the latency of a completion interrupt that the hypervisor failed
- * to deliver to an idle vCPU to ~VIOSTOR_POLL_INTERVAL_US instead of the
- * ~250ms StorPort watchdog. It never completes a request the device hasn't
- * published to the used ring, so it cannot complete I/O early.
- */
-VOID VioStorCompletionPoll(IN PVOID DeviceExtension, IN PVOID Context)
-{
-    PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
-    ULONG i;
-
-    UNREFERENCED_PARAMETER(Context);
-
-    InterlockedIncrement(&adaptExt->dbgPollCalls);
-
-    for (i = 0; i < adaptExt->num_queues; i++)
-    {
-        VioStorCompleteRequest(DeviceExtension, i + adaptExt->msix_has_config_vector, FALSE);
-    }
-
-    if (VioStorHasOutstanding(adaptExt))
-    {
-        /* Still busy: keep polling (pollArmed stays 1). */
-        StorPortRequestTimer(DeviceExtension,
-                             adaptExt->completionPollTimer,
-                             VioStorCompletionPoll,
-                             NULL,
-                             VIOSTOR_POLL_INTERVAL_US,
-                             0);
-    }
-    else
-    {
-        /* Idle: stop. Re-check after clearing to catch a submit that raced in
-         * between the drain above and the store below. */
-        InterlockedExchange(&adaptExt->pollArmed, 0);
-        if (VioStorHasOutstanding(adaptExt))
-        {
-            VioStorArmCompletionPoll(DeviceExtension);
-        }
-    }
-}
-
-/*
- * Inline busy-poll of one queue's used ring from the submit path.
- *
- * Called right after virtqueue_notify when the queue is at low depth. Spins
- * draining the used ring (via VioStorCompleteRequest, exactly like the IRQ/DPC
- * and timer paths) until the queue empties or the budget elapses, so a request
- * whose completion interrupt the hypervisor drops on an idle vCPU is reaped in
- * microseconds instead of waiting for the ~250ms StorPort watchdog.
- *
- * Safe at DISPATCH_LEVEL: VioStorCompleteRequest takes and releases the queue
- * lock itself each call, and StorPort already supports completing requests from
- * the StartIo/submit context (see STOR_PERF_OPTIMIZE_FOR_COMPLETION_DURING_STARTIO).
- */
-VOID VioStorBusyPollComplete(IN PVOID DeviceExtension, IN ULONG MessageID, IN ULONG QueueNumber, IN ULONG DataLen)
-{
-#if VIOSTOR_BUSYPOLL_ENABLE
-    PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
-    PREQUEST_LIST element = &adaptExt->processing_srbs[QueueNumber];
-    ULONG spins = VIOSTOR_BUSYPOLL_BUDGET_US / VIOSTOR_BUSYPOLL_STALL_US;
-    ULONG i;
-
-    /* Crashdump/hibernate runs its own synchronous polled completion loop and is
-     * not a throughput path; leave it on the existing mechanism. */
-    if (adaptExt->dump_mode)
-    {
-        return;
-    }
-
-    /* Small transfers run at high queue depth where interrupts already work;
-     * draining them inline would serialize the queue to QD1. Only spin for large
-     * (sequential) transfers, which is where the idle-vCPU stall caps throughput. */
-    if (DataLen < VIOSTOR_BUSYPOLL_MIN_BYTES)
-    {
-        return;
-    }
-
-    /* High queue depth: the vCPU is already busy and sees completions via the
-     * normal path; spinning would just burn cycles the workload could use. */
-    if (element->srb_cnt > VIOSTOR_BUSYPOLL_MAX_INFLIGHT)
-    {
-        return;
-    }
-
-    InterlockedIncrement(&adaptExt->dbgSubmitPollCalls);
-
-    for (i = 0; i < spins; i++)
-    {
-        /* Drain whatever the device has published so far. This completes our
-         * request (and any sibling) as soon as it lands in the used ring. */
-        VioStorCompleteRequest(DeviceExtension, MessageID, FALSE);
-
-        /* srb_cnt is a plain read of the per-queue counter; at low depth it
-         * reaching zero means our request(s) are done. A request that another
-         * CPU submits into this queue mid-spin keeps it non-zero, but the budget
-         * still bounds us and that case is not the idle-vCPU stall we target. */
-        if (element->srb_cnt == 0)
-        {
-            break;
-        }
-
-        StorPortStallExecution(VIOSTOR_BUSYPOLL_STALL_US);
-    }
-#else
-    UNREFERENCED_PARAMETER(DeviceExtension);
-    UNREFERENCED_PARAMETER(MessageID);
-    UNREFERENCED_PARAMETER(QueueNumber);
-#endif
 }
 
 VOID LogError(IN PVOID DeviceExtension, IN ULONG ErrorCode, IN ULONG UniqueId)
@@ -3086,36 +2430,6 @@ VOID LogError(IN PVOID DeviceExtension, IN ULONG ErrorCode, IN ULONG UniqueId)
     logEvent.ErrorCode = ErrorCode;
     logEvent.DumpDataSize = sizeof(UniqueId);
     logEvent.DumpData = &UniqueId;
-    StorPortLogSystemEvent(DeviceExtension, &logEvent, NULL);
-}
-
-/* DIAG: emit the ISR/completion counters to the System event log so they can be
- * read over SSH (Get-WinEvent), since DbgPrint only reaches DebugView on the
- * interactive desktop. ErrorCode 0xD1A60001 is the find tag. DumpData carries
- * [isrCalls, completedTotal, completedInIsr, pollFirings, submitPolls]. Decisive
- * read: isrCalls grows ~with completedTotal => the INTx ISR IS being delivered
- * (latency/wake problem); isrCalls stays flat while completedTotal climbs => the
- * ISR never runs => SPI 38 is NOT delivered to Windows (firmware/ACPI wiring). */
-VOID VioStorDiagLog(IN PVOID DeviceExtension)
-{
-    PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
-    STOR_LOG_EVENT_DETAILS logEvent;
-    ULONG dump[5];
-
-    dump[0] = (ULONG)adaptExt->dbgIsrCalls;
-    dump[1] = (ULONG)adaptExt->dbgCompletedTotal;
-    dump[2] = (ULONG)adaptExt->dbgCompletedIsr;
-    dump[3] = (ULONG)adaptExt->dbgPollCalls;
-    dump[4] = (ULONG)adaptExt->dbgSubmitPollCalls;
-
-    memset(&logEvent, 0, sizeof(logEvent));
-    logEvent.InterfaceRevision = STOR_CURRENT_LOG_INTERFACE_REVISION;
-    logEvent.Size = sizeof(logEvent);
-    logEvent.EventAssociation = StorEventAdapterAssociation;
-    logEvent.StorportSpecificErrorCode = TRUE;
-    logEvent.ErrorCode = 0xD1A60001;
-    logEvent.DumpDataSize = sizeof(dump);
-    logEvent.DumpData = dump;
     StorPortLogSystemEvent(DeviceExtension, &logEvent, NULL);
 }
 

@@ -40,7 +40,7 @@
 #include "virtio.h"
 #include "virtio_ring.h"
 #include "virtio_stor_utils.h"
-#include "viostor_bounce.h"
+#include "viostor_rdma.h"
 
 typedef struct VirtIOBufferDescriptor VIO_SG, *PVIO_SG;
 
@@ -96,64 +96,7 @@ typedef struct VirtIOBufferDescriptor VIO_SG, *PVIO_SG;
 #define MAX_PHYS_SEGMENTS                  512
 #define VIRTIO_MAX_SG                      (3 + MAX_PHYS_SEGMENTS)
 
-/* Keep advertised SRB transfers below the 1MiB boundary where DroidVM's
- * restricted-DMA virtio-blk path can fall back to watchdog-paced completion. */
-#define VIOSTOR_MAX_TRANSFER_LENGTH_CAP    (960 * 1024)
-#define VIOSTOR_SPLIT_CHILD_LENGTH         VIOSTOR_MAX_TRANSFER_LENGTH_CAP
-#define VIOSTOR_SPLIT_MAX_TRANSFER_LENGTH  (1024 * 1024)
-#define VIOSTOR_SPLIT_MAX_CHILDREN         2
-#define VIOSTOR_SPLIT_MAX_SG               ((VIOSTOR_SPLIT_CHILD_LENGTH / PAGE_SIZE) + 2)
-
 #define VIOBLK_POOL_TAG                    'BoiV'
-
-/* Completion-poll fallback period, microseconds (worst-case extra latency for a
- * completion interrupt that the hypervisor failed to deliver to an idle vCPU). */
-#define VIOSTOR_POLL_INTERVAL_US           1000
-
-/*
- * Inline busy-poll on the submit path.
- *
- * On this hypervisor a completion interrupt is not delivered to an idle vCPU,
- * and the StorPort timer that backs the poll fallback (VioStorCompletionPoll)
- * also does not fire promptly once the vCPU has halted (WFI). At low queue
- * depth — e.g. CrystalDiskMark SEQ Q1 or any single-threaded sequential stream —
- * the vCPU goes idle right after submitting, so each request is reaped only by
- * the ~250ms StorPort watchdog. That caps a ~960KB transfer at ~4-5 MB/s even
- * though random Q32 (which keeps the vCPU busy) reaches full speed.
- *
- * The fix that does not depend on the peer waking us: after notifying the
- * device, do NOT let the vCPU halt. Spin-drain the used ring directly (the
- * device publishes completions to shared memory regardless of interrupts) until
- * our request is reaped or a bounded budget elapses. This converts the idle
- * wait into an active wait, so the completion is observed in microseconds.
- *
- * Engaged only when few requests are in flight: at high queue depth the vCPU is
- * already busy submitting/draining and sees completions promptly, so spinning
- * would just waste cycles. At low queue depth the vCPU would otherwise be idle,
- * so the spin costs nothing the workload could have used.
- *
- * IMPORTANT — only for large (sequential) transfers. StorPort calls StartIo
- * serially, so draining to completion inside the submit path prevents the queue
- * from ever building depth: every submit would see a near-empty queue, busy-poll,
- * and complete before the next StartIo, collapsing a deep small-I/O workload to
- * QD1. Small-block workloads (e.g. 4K random) are run at high queue depth where
- * interrupts already work, so they must NOT busy-poll. Gate on transfer size:
- * the idle-vCPU stall only meaningfully caps throughput for big per-I/O payloads
- * (the classic sequential pattern), which is exactly where we want to spin.
- */
-#define VIOSTOR_BUSYPOLL_ENABLE            0
-/* Only busy-poll when at most this many requests are outstanding on the queue
- * (counts the just-submitted request, including each split child). */
-#define VIOSTOR_BUSYPOLL_MAX_INFLIGHT      4
-/* Only busy-poll transfers at least this large. Below this, skip so high-QD
- * small-I/O concurrency is preserved (see the serialization note above). */
-#define VIOSTOR_BUSYPOLL_MIN_BYTES         (64 * 1024)
-/* Total spin budget per submit, microseconds. Bounds DISPATCH_LEVEL spinning;
- * if the device is slower than this the request falls back to the poll timer /
- * IRQ / watchdog as before. */
-#define VIOSTOR_BUSYPOLL_BUDGET_US         2000
-/* Pause between drain attempts, microseconds. */
-#define VIOSTOR_BUSYPOLL_STALL_US          4
 
 #pragma pack(1)
 typedef struct virtio_blk_config
@@ -243,7 +186,6 @@ typedef struct virtio_blk_req
 {
     LIST_ENTRY list_entry;
     PVOID req;
-    ULONG_PTR id;
     blk_outhdr out_hdr;
     u8 status;
 } blk_req, *pblk_req;
@@ -321,35 +263,23 @@ typedef struct _ADAPTER_EXTENSION
     ULONG reset_in_progress_count;
     ULONGLONG fw_ver;
 
-    /* Restricted DMA pool support */
+    /* Restricted DMA pool (Gunyah protected VM). When rdmaPoolActive, vrings and
+     * all device-visible I/O staging live in this contiguous pool region; see
+     * viostor_rdma.c. */
     BOOLEAN rdmaPoolActive;
+    PDEVICE_OBJECT rdmaPoolDeviceObject;
+    PFILE_OBJECT rdmaPoolFileObject;
     PVOID rdmaPoolBaseVA;
     PHYSICAL_ADDRESS rdmaPoolBasePA;
     ULONG64 rdmaPoolSize;
-    PDEVICE_OBJECT rdmaPoolDeviceObject;
-    PFILE_OBJECT rdmaPoolFileObject;
     BOUNCE_ALLOCATOR bounce;
 
-    /* Completion-poll fallback (see VioStorCompletionPoll). Some virtio
-     * completion interrupts are not delivered to an idle vCPU on this
-     * hypervisor, so a request can be reaped only by the ~250ms StorPort
-     * watchdog. A lightweight timer drains the used rings while requests are
-     * outstanding, turning a missed IRQ into ~1ms of extra latency. Adaptive:
-     * armed on submit, self-stops when nothing is in flight. */
-    PVOID completionPollTimer;
-    LONG pollArmed;
-
-    /* Diagnostic counters for the completion-path investigation: are completion
-     * MSI-X interrupts actually reaching the guest, or are completions only being
-     * reaped by the poll timer / inline busy-poll? Always compiled (the shipped
-     * build is Release, so #ifdef DBG counters would be absent). Dumped
-     * periodically via RhelDbgPrint(TRACE_LEVEL_FATAL). */
-    volatile LONG dbgIsrCalls;        /* ISR (MSI-X / INTx) invocations */
-    volatile LONG dbgCompletedTotal;  /* total requests reaped from used rings */
-    volatile LONG dbgCompletedIsr;    /* reaped in ISR context (bIsr == TRUE) */
-    volatile LONG dbgPollCalls;       /* completion-poll timer firings */
-    volatile LONG dbgSubmitPollCalls; /* inline submit-path busy-poll engagements */
-
+    /* Completion poll thread (replaces inline busy-poll). */
+    PVOID pollThread;          /* PKTHREAD referenced object */
+    KEVENT pollWake;           /* signalled by submit path / kick */
+    KTIMER pollTimer;          /* periodic ~1ms tick while draining */
+    volatile LONG pollStop;    /* set to 1 to ask the thread to exit */
+    volatile LONG pollOutstanding; /* >0 while requests are in flight */
 #ifdef DBG
     LONG srb_cnt;
     LONG inqueue_cnt;
@@ -364,19 +294,6 @@ typedef struct _VRING_DESC_ALIAS
     } u;
 } VRING_DESC_ALIAS;
 
-typedef struct _VIOSTOR_SPLIT_CHILD
-{
-    blk_req vbr;
-    ULONG out;
-    ULONG in;
-    VIO_SG sg[VIOSTOR_SPLIT_MAX_SG];
-    PVOID bounceCtl;
-    PVOID originalDataVA;
-    ULONG bounceDataChunkCount;
-    ULONG dataOffset;
-    ULONG dataLength;
-} VIOSTOR_SPLIT_CHILD, *PVIOSTOR_SPLIT_CHILD;
-
 typedef struct _SRB_EXTENSION
 {
     blk_req vbr;
@@ -388,15 +305,12 @@ typedef struct _SRB_EXTENSION
     VIO_SG sg[VIRTIO_MAX_SG];
     VRING_DESC_ALIAS desc[VIRTIO_MAX_SG];
     blk_discard_write_zeroes blk_discard[MAX_DISCARD_SEGMENTS];
-    /* Bounce buffer tracking (rdmapool) */
-    PVOID bounceCtl;            /* Control slot VA in rdmapool, NULL if not bouncing */
-    PVOID originalDataVA;       /* Original data buffer VA for read copy-back */
-    ULONG bounceDataChunkCount; /* Number of contiguous data chunks allocated from bounce pool */
-    BOOLEAN split;
-    ULONG splitChildCount;
-    LONG splitRemaining;
-    LONG splitStatus;
-    VIOSTOR_SPLIT_CHILD splitChildren[VIOSTOR_SPLIT_MAX_CHILDREN];
+
+    /* Bounce staging for the restricted DMA pool path (viostor_rdma.c). */
+    PVOID bounceCtl;          /* control slot (out_hdr + status) VA, or NULL */
+    ULONG bounceChunkCount;   /* number of data chunks in sg[1..count] */
+    PUCHAR srbDataVA;         /* system VA of the original SRB data buffer */
+    ULONG srbDataLen;         /* bytes of I/O data */
 } SRB_EXTENSION, *PSRB_EXTENSION;
 
 BOOLEAN
