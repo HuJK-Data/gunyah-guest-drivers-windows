@@ -102,7 +102,12 @@ NTSTATUS VioStorConnectRdmaPool(PVOID DeviceExtension)
     }
 
     RtlZeroMemory(&queryOutput, sizeof(queryOutput));
-    status = VioStorRdmaPoolIoctl(adaptExt, (ULONG)IOCTL_RDMAPOOL_QUERY_POOL, NULL, 0, &queryOutput, sizeof(queryOutput));
+    status = VioStorRdmaPoolIoctl(adaptExt,
+                                  (ULONG)IOCTL_RDMAPOOL_QUERY_POOL,
+                                  NULL,
+                                  0,
+                                  &queryOutput,
+                                  sizeof(queryOutput));
     if (!NT_SUCCESS(status))
     {
         DbgPrint(" rdmapool: QUERY_POOL failed 0x%x\n", status);
@@ -154,11 +159,11 @@ NTSTATUS VioStorConnectRdmaPool(PVOID DeviceExtension)
     adaptExt->pageOffset = 0;
 
     DbgPrint(" rdmapool: connected VA=%p PA=0x%I64x pages=%u (rings=%u bounce=%u)\n",
-                 adaptExt->rdmaPoolBaseVA,
-                 adaptExt->rdmaPoolBasePA.QuadPart,
-                 totalPages,
-                 ringPages,
-                 bouncePages);
+             adaptExt->rdmaPoolBaseVA,
+             adaptExt->rdmaPoolBasePA.QuadPart,
+             totalPages,
+             ringPages,
+             bouncePages);
     return STATUS_SUCCESS;
 }
 
@@ -302,11 +307,11 @@ NTSTATUS VioStorBounceInit(PVOID DeviceExtension)
 
     a->Initialized = TRUE;
     DbgPrint(" bounce: ctl=%u(%uB) data=%u x %uKB @ VA=%p\n",
-                 a->CtlSlotCount,
-                 BOUNCE_CTL_SIZE,
-                 a->DataChunkCount,
-                 a->DataChunkSize / 1024,
-                 a->BaseVA);
+             a->CtlSlotCount,
+             BOUNCE_CTL_SIZE,
+             a->DataChunkCount,
+             a->DataChunkSize / 1024,
+             a->BaseVA);
     return (a->CtlSlotCount && a->DataChunkCount) ? STATUS_SUCCESS : STATUS_INSUFFICIENT_RESOURCES;
 }
 

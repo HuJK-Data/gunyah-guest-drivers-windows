@@ -33,8 +33,8 @@
  * Indirect descriptors are disabled on the rdmapool path, so no indirect table
  * is needed here. DISCARD is not negotiated on this path, so no discard area.
  */
-#define BOUNCE_CTL_PAGES        1
-#define BOUNCE_CTL_SIZE         (BOUNCE_CTL_PAGES * PAGE_SIZE)
+#define BOUNCE_CTL_PAGES         1
+#define BOUNCE_CTL_SIZE          (BOUNCE_CTL_PAGES * PAGE_SIZE)
 #define BOUNCE_CTL_OUTHDR_OFFSET 0
 #define BOUNCE_CTL_STATUS_OFFSET 16 /* sizeof(blk_outhdr) = u32 + u32 + u64 */
 #define BOUNCE_CTL_SN_OFFSET     32 /* BLOCK_SERIAL_STRLEN (20) bytes */
@@ -44,7 +44,7 @@
  * a handful of descriptors (1MB -> ceil(1MB/chunk)), not 256 per-page descriptors.
  * Clamped down to the device size_max at init.
  */
-#define BOUNCE_DATA_CHUNK_SIZE  (256 * 1024)
+#define BOUNCE_DATA_CHUNK_SIZE   (256 * 1024)
 
 /*
  * Poll thread cadence. Adaptive: while I/O is in flight the thread spin-drains
@@ -52,8 +52,8 @@
  * burned only during active I/O, never blocking StartIo); when idle it blocks on
  * the wake event with a safety-net timeout (≈0 CPU).
  */
-#define VIOSTOR_POLL_SPIN_US       10  /* stall between drains while busy */
-#define VIOSTOR_POLL_IDLE_MS       100 /* idle safety-net wakeup */
+#define VIOSTOR_POLL_SPIN_US     10  /* stall between drains while busy */
+#define VIOSTOR_POLL_IDLE_MS     100 /* idle safety-net wakeup */
 
 typedef struct _BOUNCE_ALLOCATOR
 {

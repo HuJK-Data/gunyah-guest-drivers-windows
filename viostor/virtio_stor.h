@@ -275,9 +275,9 @@ typedef struct _ADAPTER_EXTENSION
     BOUNCE_ALLOCATOR bounce;
 
     /* Completion poll thread (replaces inline busy-poll). */
-    PVOID pollThread;          /* PKTHREAD referenced object */
-    KEVENT pollWake;           /* signalled by submit path / kick */
-    volatile LONG pollStop;    /* set to 1 to ask the thread to exit */
+    PVOID pollThread;       /* PKTHREAD referenced object */
+    KEVENT pollWake;        /* signalled by submit path / kick */
+    volatile LONG pollStop; /* set to 1 to ask the thread to exit */
 #ifdef DBG
     LONG srb_cnt;
     LONG inqueue_cnt;
@@ -305,10 +305,10 @@ typedef struct _SRB_EXTENSION
     blk_discard_write_zeroes blk_discard[MAX_DISCARD_SEGMENTS];
 
     /* Bounce staging for the restricted DMA pool path (viostor_rdma.c). */
-    PVOID bounceCtl;          /* control slot (out_hdr + status) VA, or NULL */
-    ULONG bounceChunkCount;   /* number of data chunks in sg[1..count] */
-    PUCHAR srbDataVA;         /* system VA of the original SRB data buffer */
-    ULONG srbDataLen;         /* bytes of I/O data */
+    PVOID bounceCtl;        /* control slot (out_hdr + status) VA, or NULL */
+    ULONG bounceChunkCount; /* number of data chunks in sg[1..count] */
+    PUCHAR srbDataVA;       /* system VA of the original SRB data buffer */
+    ULONG srbDataLen;       /* bytes of I/O data */
 } SRB_EXTENSION, *PSRB_EXTENSION;
 
 BOOLEAN
