@@ -163,7 +163,4 @@ VOID CompleteRequestWithStatus(IN PVOID DeviceExtension, IN PSRB_TYPE Srb, IN UC
 
 extern VirtIOSystemOps VioStorSystemOps;
 
-NTSTATUS VioStorConnectRdmaPool(PADAPTER_EXTENSION adaptExt);
-VOID VioStorDisconnectRdmaPool(PADAPTER_EXTENSION adaptExt);
-
 #endif ___VIOSTOR_HW_HELPER_H___

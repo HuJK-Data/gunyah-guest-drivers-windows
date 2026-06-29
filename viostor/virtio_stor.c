@@ -1,4 +1,4 @@
-﻿/*
+/*
  * This file contains viostor StorPort(ScsiPort) miniport driver
  *
  * Copyright (c) 2008-2017 Red Hat, Inc.
@@ -519,6 +519,22 @@ VirtIoFindAdapter(IN PVOID DeviceExtension,
     {
         adaptExt->poolAllocationVa = (PVOID)((ULONG_PTR)adaptExt->pageAllocationVa + adaptExt->pageAllocationSize);
     }
+
+    /*
+     * Restricted DMA pool (Gunyah protected VM): redirect the vrings into
+     * rdmapool (device-visible memory) and stage all I/O through bounce buffers.
+     * Use direct descriptors and a fixed large-chunk transfer size; completions
+     * are reaped by the poll thread plus the ISR. Driver-internal pool memory
+     * (poolAllocationVa) stays in the uncached extension. No-op if rdmapool is
+     * absent (normal KVM path).
+     */
+    if (NT_SUCCESS(VioStorConnectRdmaPool(DeviceExtension)))
+    {
+        adaptExt->indirect = FALSE;
+        ConfigInfo->MaximumTransferLength = BOUNCE_DATA_CHUNK_SIZE;
+        ConfigInfo->NumberOfPhysicalBreaks = (BOUNCE_DATA_CHUNK_SIZE / PAGE_SIZE) + 1;
+        adaptExt->max_tx_length = ConfigInfo->MaximumTransferLength;
+    }
     RhelDbgPrint(TRACE_LEVEL_INFORMATION,
                  " Page-aligned area at %p, size = %d\n",
                  adaptExt->pageAllocationVa,
@@ -527,9 +543,6 @@ VirtIoFindAdapter(IN PVOID DeviceExtension,
                  " Pool area at %p, size = %d\n",
                  adaptExt->poolAllocationVa,
                  adaptExt->poolAllocationSize);
-
-    VioStorConnectRdmaPool(adaptExt);
-
     RhelDbgPrint(TRACE_LEVEL_INFORMATION, " pmsg_affinity = %p\n", adaptExt->pmsg_affinity);
     if (!adaptExt->dump_mode && (adaptExt->num_queues > 1) && (adaptExt->pmsg_affinity == NULL))
     {
@@ -555,6 +568,25 @@ VirtIoPassiveInitializeRoutine(IN PVOID DeviceExtension)
         StorPortInitializeDpc(DeviceExtension, &adaptExt->dpc[index], CompleteDpcRoutine);
     }
     adaptExt->dpc_ok = TRUE;
+
+    /*
+     * Restricted DMA pool path: carve the bounce allocator out of the rdmapool
+     * region left after the vrings, and start the completion poll thread. Both
+     * require PASSIVE_LEVEL, which is why they live here and not in HwInitialize.
+     */
+    if (adaptExt->rdmaPoolActive)
+    {
+        if (!NT_SUCCESS(VioStorBounceInit(DeviceExtension)))
+        {
+            RhelDbgPrint(TRACE_LEVEL_FATAL, " bounce init failed\n");
+            return FALSE;
+        }
+        if (!NT_SUCCESS(VioStorStartPollThread(DeviceExtension)))
+        {
+            RhelDbgPrint(TRACE_LEVEL_FATAL, " poll thread start failed\n");
+            return FALSE;
+        }
+    }
     return TRUE;
 }
 
@@ -733,32 +765,6 @@ VirtIoHwInitialize(IN PVOID DeviceExtension)
         return ret;
     }
 
-    /* Initialize bounce buffer allocator from remaining rdmapool space */
-    if (adaptExt->rdmaPoolActive)
-    {
-        PUCHAR bounceBase = (PUCHAR)adaptExt->pageAllocationVa + adaptExt->pageOffset;
-        SIZE_T bounceSize;
-        PHYSICAL_ADDRESS bouncePA;
-        NTSTATUS status;
-
-        bounceSize = adaptExt->pageAllocationSize - adaptExt->pageOffset;
-        bouncePA.QuadPart = adaptExt->rdmaPoolBasePA.QuadPart + adaptExt->pageOffset;
-
-        RhelDbgPrint(TRACE_LEVEL_INFORMATION,
-                     " Bounce region: VA=%p PA=0x%I64x Size=0x%Ix (after ring offset 0x%x)\n",
-                     bounceBase,
-                     bouncePA.QuadPart,
-                     bounceSize,
-                     adaptExt->pageOffset);
-
-        status = BounceInit(&adaptExt->bounce, bounceBase, bouncePA, bounceSize, adaptExt->queue_depth);
-        if (!NT_SUCCESS(status))
-        {
-            RhelDbgPrint(TRACE_LEVEL_ERROR, " BounceInit failed 0x%x, disabling rdmapool bounce\n", status);
-            adaptExt->rdmaPoolActive = FALSE;
-        }
-    }
-
     memset(&adaptExt->inquiry_data, 0, sizeof(INQUIRYDATA));
 
     adaptExt->inquiry_data.ANSIVersion = 4;
@@ -906,11 +912,6 @@ static VOID CompletePendingRequestsOnReset(IN PVOID DeviceExtension)
                 PSCSI_REQUEST_BLOCK Srb = (PSCSI_REQUEST_BLOCK)req->req;
                 if (Srb)
                 {
-                    PSRB_EXTENSION srbExt = SRB_EXTENSION((PSRB_TYPE)Srb);
-                    if (srbExt)
-                    {
-                        BOUNCE_CLEANUP_SRB(adaptExt, srbExt);
-                    }
                     SRB_SET_DATA_TRANSFER_LENGTH(Srb, 0);
                     CompleteRequestWithStatus(DeviceExtension, (PSRB_TYPE)Srb, SRB_STATUS_BUS_RESET);
                     element->srb_cnt--;
@@ -1416,7 +1417,6 @@ VirtIoAdapterControl(IN PVOID DeviceExtension, IN SCSI_ADAPTER_CONTROL_TYPE Cont
                 }
                 if (adaptExt->stopped)
                 {
-                    VioStorDisconnectRdmaPool(adaptExt);
                     if (adaptExt->pmsg_affinity != NULL)
                     {
                         StorPortFreePool(DeviceExtension, (PVOID)adaptExt->pmsg_affinity);
@@ -1593,6 +1593,28 @@ VirtIoBuildIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
         return FALSE;
     }
 
+    /*
+     * Restricted DMA pool: the device cannot touch the guest data pages in the
+     * SGL, so stage the entire transfer through a few large contiguous bounce
+     * chunks (out_hdr + chunks + status, all in rdmapool). No per-4KB-page
+     * descriptors, no hard splitting in the driver.
+     */
+    if (adaptExt->rdmaPoolActive)
+    {
+        srbExt->vbr.out_hdr.sector = lba;
+        srbExt->vbr.out_hdr.ioprio = 0;
+        srbExt->vbr.req = (PVOID)Srb;
+        srbExt->fua = CHECKBIT(adaptExt->features, VIRTIO_BLK_F_FLUSH) ? (cdb->CDB10.ForceUnitAccess == 1) : FALSE;
+        srbExt->vbr.out_hdr.type = (SRB_FLAGS(Srb) & SRB_FLAGS_DATA_OUT) ? VIRTIO_BLK_T_OUT : VIRTIO_BLK_T_IN;
+        if (!VioStorBounceBuild(DeviceExtension, Srb))
+        {
+            /* Pool momentarily exhausted; ask the class driver to retry. */
+            CompleteRequestWithStatus(DeviceExtension, (PSRB_TYPE)Srb, SRB_STATUS_BUSY);
+            return FALSE;
+        }
+        return TRUE;
+    }
+
     sgMaxElements = min((MAX_PHYS_SEGMENTS + 1), sgList->NumberOfElements);
 
     if (CHECKBIT(adaptExt->features, VIRTIO_BLK_F_SIZE_MAX))
@@ -1653,107 +1675,11 @@ VirtIoBuildIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
         srbExt->in = sgElement;
     }
 
-    /* Bounce buffer setup for restricted DMA pool */
-    if (adaptExt->rdmaPoolActive && adaptExt->bounce.Initialized)
-    {
-        PVOID ctlSlot;
-        PVOID dataVA = NULL;
-        BOOLEAN isWrite = !!(SRB_FLAGS(Srb) & SRB_FLAGS_DATA_OUT);
-        ULONG dataPageCount = 0;
-        SIZE_T dataOffset = 0;
-        ULONG totalDataLen = SRB_DATA_TRANSFER_LENGTH(Srb);
-        ULONG newSgIdx = 1;
-        ULONG j;
+    srbExt->sg[0].physAddr = StorPortGetPhysicalAddress(DeviceExtension, NULL, &srbExt->vbr.out_hdr, &dummy);
+    srbExt->sg[0].length = sizeof(srbExt->vbr.out_hdr);
 
-        ctlSlot = BounceAllocCtl(&adaptExt->bounce);
-        if (!ctlSlot)
-        {
-            RhelDbgPrint(TRACE_LEVEL_ERROR, " Bounce: no control slots available\n");
-            CompleteRequestWithStatus(DeviceExtension, (PSRB_TYPE)Srb, SRB_STATUS_BUSY);
-            return FALSE;
-        }
-        srbExt->bounceCtl = ctlSlot;
-
-        /* Copy out_hdr to bounce control slot */
-        RtlCopyMemory((PUCHAR)ctlSlot + BOUNCE_CTL_OUTHDR_OFFSET, &srbExt->vbr.out_hdr, sizeof(srbExt->vbr.out_hdr));
-
-        /* Header SG → bounce */
-        srbExt->sg[0].physAddr = BounceVAtoPA(&adaptExt->bounce, (PUCHAR)ctlSlot + BOUNCE_CTL_OUTHDR_OFFSET);
-        srbExt->sg[0].length = sizeof(srbExt->vbr.out_hdr);
-
-        /* Get system VA for data buffer copy */
-        if (totalDataLen > 0)
-        {
-            ULONG sysAddrStatus = StorPortGetSystemAddress(DeviceExtension, Srb, &dataVA);
-            if (sysAddrStatus != STOR_STATUS_SUCCESS || dataVA == NULL)
-            {
-                BounceFreeCtl(&adaptExt->bounce, ctlSlot);
-                srbExt->bounceCtl = NULL;
-                RhelDbgPrint(TRACE_LEVEL_ERROR, " Bounce: StorPortGetSystemAddress failed 0x%x\n", sysAddrStatus);
-                CompleteRequestWithStatus(DeviceExtension, (PSRB_TYPE)Srb, SRB_STATUS_ERROR);
-                return FALSE;
-            }
-        }
-        srbExt->originalDataVA = dataVA;
-
-        /* Allocate bounce pages for data, splitting into PAGE_SIZE chunks */
-        for (dataOffset = 0; dataOffset < totalDataLen;)
-        {
-            PVOID bouncePage = BounceAllocDataPage(&adaptExt->bounce);
-            ULONG chunkLen;
-
-            if (!bouncePage)
-            {
-                /* Free previously allocated data pages */
-                for (j = 1; j <= dataPageCount; j++)
-                {
-                    BounceFreeDataPage(&adaptExt->bounce, BouncePAtoVA(&adaptExt->bounce, srbExt->sg[j].physAddr));
-                }
-                BounceFreeCtl(&adaptExt->bounce, ctlSlot);
-                srbExt->bounceCtl = NULL;
-                RhelDbgPrint(TRACE_LEVEL_ERROR, " Bounce: no data pages\n");
-                CompleteRequestWithStatus(DeviceExtension, (PSRB_TYPE)Srb, SRB_STATUS_BUSY);
-                return FALSE;
-            }
-            dataPageCount++;
-            chunkLen = min(PAGE_SIZE, totalDataLen - (ULONG)dataOffset);
-
-            if (isWrite && dataVA)
-            {
-                RtlCopyMemory(bouncePage, (PUCHAR)dataVA + dataOffset, chunkLen);
-            }
-
-            srbExt->sg[newSgIdx].physAddr = BounceVAtoPA(&adaptExt->bounce, bouncePage);
-            srbExt->sg[newSgIdx].length = chunkLen;
-            newSgIdx++;
-            dataOffset += chunkLen;
-        }
-        srbExt->bounceDataPageCount = dataPageCount;
-
-        /* Status SG → bounce */
-        srbExt->sg[newSgIdx].physAddr = BounceVAtoPA(&adaptExt->bounce, (PUCHAR)ctlSlot + BOUNCE_CTL_STATUS_OFFSET);
-        srbExt->sg[newSgIdx].length = sizeof(srbExt->vbr.status);
-
-        /* Update out/in counts to reflect bounce layout */
-        if (isWrite)
-        {
-            srbExt->out = newSgIdx; /* hdr + data pages */
-            srbExt->in = 1;         /* status */
-        }
-        else
-        {
-            srbExt->out = 1;       /* hdr */
-            srbExt->in = newSgIdx; /* data pages + status */
-        }
-    }
-    else
-    {
-        srbExt->sg[0].physAddr = StorPortGetPhysicalAddress(DeviceExtension, NULL, &srbExt->vbr.out_hdr, &dummy);
-        srbExt->sg[0].length = sizeof(srbExt->vbr.out_hdr);
-
-        srbExt->sg[sgElement].physAddr = StorPortGetPhysicalAddress(DeviceExtension, NULL, &srbExt->vbr.status, &dummy);
-        srbExt->sg[sgElement].length = sizeof(srbExt->vbr.status);
-    }
+    srbExt->sg[sgElement].physAddr = StorPortGetPhysicalAddress(DeviceExtension, NULL, &srbExt->vbr.status, &dummy);
+    srbExt->sg[sgElement].length = sizeof(srbExt->vbr.status);
 
     return TRUE;
 }
@@ -2404,16 +2330,17 @@ VOID VioStorCompleteRequest(IN PVOID DeviceExtension, IN ULONG MessageID, IN BOO
                 RhelDbgPrint(TRACE_LEVEL_WARNING, " No Srb to complete for ID 0x%p\n", (void *)srbId);
             }
 
+            /* Restricted DMA pool: copy reads out of the bounce chunks, latch the
+             * device status / serial, and free the bounce resources before any
+             * completion logic reads srbExt->vbr.status or adaptExt->sn. No-op for
+             * non-bounced requests. */
+            if (bFound && srbExt && srbExt->bounceCtl)
+            {
+                VioStorBounceComplete(DeviceExtension, srbExt);
+            }
+
             if (bFound && srbExt->vbr.out_hdr.type == VIRTIO_BLK_T_GET_ID)
             {
-                /* Bounce cleanup for GET_ID: copy sn and status from bounce slot */
-                if (srbExt->bounceCtl)
-                {
-                    RtlCopyMemory(adaptExt->sn, (PUCHAR)srbExt->bounceCtl + BOUNCE_CTL_SN_OFFSET, sizeof(adaptExt->sn));
-                    srbExt->vbr.status = *((u8 *)((PUCHAR)srbExt->bounceCtl + BOUNCE_CTL_STATUS_OFFSET));
-                    BounceFreeCtl(&adaptExt->bounce, srbExt->bounceCtl);
-                    srbExt->bounceCtl = NULL;
-                }
                 adaptExt->sn_ok = TRUE;
                 if (Srb)
                 {
@@ -2456,29 +2383,6 @@ VOID VioStorCompleteRequest(IN PVOID DeviceExtension, IN ULONG MessageID, IN BOO
             }
             if (bFound && Srb)
             {
-                /* Bounce cleanup: copy status and read data back, free bounce buffers */
-                if (srbExt->bounceCtl)
-                {
-                    /* Copy device-written status from bounce */
-                    srbExt->vbr.status = *((u8 *)((PUCHAR)srbExt->bounceCtl + BOUNCE_CTL_STATUS_OFFSET));
-
-                    /* For reads: copy data from bounce pages back to original buffer */
-                    if (srbExt->vbr.out_hdr.type == VIRTIO_BLK_T_IN && srbExt->originalDataVA != NULL &&
-                        srbExt->bounceDataPageCount > 0)
-                    {
-                        SIZE_T offset = 0;
-                        ULONG bIdx;
-                        for (bIdx = 1; bIdx <= srbExt->bounceDataPageCount; bIdx++)
-                        {
-                            PVOID srcVA = BouncePAtoVA(&adaptExt->bounce, srbExt->sg[bIdx].physAddr);
-                            RtlCopyMemory((PUCHAR)srbExt->originalDataVA + offset, srcVA, srbExt->sg[bIdx].length);
-                            offset += srbExt->sg[bIdx].length;
-                        }
-                    }
-
-                    BOUNCE_CLEANUP_SRB(adaptExt, srbExt);
-                }
-
                 srbStatus = DeviceToSrbStatus(srbExt->vbr.status);
                 RhelDbgPrint(TRACE_LEVEL_INFORMATION,
                              " srb %p, QueueNumber %lu, MessageId %lu.\n",
