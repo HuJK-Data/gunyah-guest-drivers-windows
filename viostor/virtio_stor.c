@@ -2895,13 +2895,15 @@ VOID VioStorCompleteRequest(IN PVOID DeviceExtension, IN ULONG MessageID, IN BOO
          * by poll/busy-poll (interrupt suppressed or not waking the vCPU). */
         if ((newTotal / 2000) != ((newTotal - (LONG)dbgReaped) / 2000))
         {
-            RhelDbgPrint(TRACE_LEVEL_FATAL,
-                         " VIOSTOR-DIAG isrCalls=%d completed=%d completedInIsr=%d pollFirings=%d submitPolls=%d\n",
-                         adaptExt->dbgIsrCalls,
-                         newTotal,
-                         adaptExt->dbgCompletedIsr,
-                         adaptExt->dbgPollCalls,
-                         adaptExt->dbgSubmitPollCalls);
+            /* Direct DbgPrint (not RhelDbgPrint, which is WPP in the Release
+             * build and would need TMF/PDB to decode) so DebugView captures it
+             * as plain text. */
+            DbgPrint("VIOSTOR-DIAG isrCalls=%d completed=%d completedInIsr=%d pollFirings=%d submitPolls=%d\n",
+                     adaptExt->dbgIsrCalls,
+                     newTotal,
+                     adaptExt->dbgCompletedIsr,
+                     adaptExt->dbgPollCalls,
+                     adaptExt->dbgSubmitPollCalls);
         }
     }
 
