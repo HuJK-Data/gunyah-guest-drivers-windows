@@ -1615,6 +1615,7 @@ VirtIoInterrupt(IN PVOID DeviceExtension)
     intReason = virtio_read_isr_status(&adaptExt->vdev);
     if (intReason & 0x1 || adaptExt->dump_mode)
     {
+        InterlockedIncrement(&adaptExt->dbgIsrCalls);
         if (!CompleteDPC(DeviceExtension, adaptExt->msix_has_config_vector))
         {
             VioStorCompleteRequest(DeviceExtension, adaptExt->msix_has_config_vector, TRUE);
@@ -1643,6 +1644,8 @@ VirtIoMSInterruptRoutine(IN PVOID DeviceExtension, IN ULONG MessageID)
         RhelDbgPrint(TRACE_LEVEL_ERROR, " MessageID = %d\n", MessageID);
         return FALSE;
     }
+
+    InterlockedIncrement(&adaptExt->dbgIsrCalls);
 
     if (MessageID == VIRTIO_BLK_MSIX_CONFIG_VECTOR)
     {
@@ -2690,6 +2693,7 @@ VOID VioStorCompleteRequest(IN PVOID DeviceExtension, IN ULONG MessageID, IN BOO
     PSRB_EXTENSION srbExt = NULL;
     UCHAR srbStatus = SRB_STATUS_SUCCESS;
     PREQUEST_LIST element = NULL;
+    ULONG dbgReaped = 0;
     LIST_ENTRY completeList;
     PLIST_ENTRY completeEntry;
 
@@ -2748,6 +2752,7 @@ VOID VioStorCompleteRequest(IN PVOID DeviceExtension, IN ULONG MessageID, IN BOO
                     RemoveEntryList(le);
                     bFound = TRUE;
                     element->srb_cnt--;
+                    dbgReaped++;
                     break;
                 }
             }
@@ -2877,6 +2882,29 @@ VOID VioStorCompleteRequest(IN PVOID DeviceExtension, IN ULONG MessageID, IN BOO
         }
     }
 
+    if (dbgReaped)
+    {
+        LONG newTotal = InterlockedAdd(&adaptExt->dbgCompletedTotal, (LONG)dbgReaped);
+        if (bIsr)
+        {
+            InterlockedAdd(&adaptExt->dbgCompletedIsr, (LONG)dbgReaped);
+        }
+        /* Dump the counters once per ~2000 completions (reliable cadence tied to
+         * I/O, unlike the self-stopping poll timer). isr ~= completed => interrupts
+         * are delivered; isr ~= 0 while completed grows => completions only reaped
+         * by poll/busy-poll (interrupt suppressed or not waking the vCPU). */
+        if ((newTotal / 2000) != ((newTotal - (LONG)dbgReaped) / 2000))
+        {
+            RhelDbgPrint(TRACE_LEVEL_FATAL,
+                         " VIOSTOR-DIAG isrCalls=%d completed=%d completedInIsr=%d pollFirings=%d submitPolls=%d\n",
+                         adaptExt->dbgIsrCalls,
+                         newTotal,
+                         adaptExt->dbgCompletedIsr,
+                         adaptExt->dbgPollCalls,
+                         adaptExt->dbgSubmitPollCalls);
+        }
+    }
+
     RhelDbgPrint(TRACE_LEVEL_VERBOSE, " <--- MessageID 0x%x\n", MessageID);
 }
 
@@ -2942,6 +2970,8 @@ VOID VioStorCompletionPoll(IN PVOID DeviceExtension, IN PVOID Context)
     ULONG i;
 
     UNREFERENCED_PARAMETER(Context);
+
+    InterlockedIncrement(&adaptExt->dbgPollCalls);
 
     for (i = 0; i < adaptExt->num_queues; i++)
     {
@@ -3012,6 +3042,8 @@ VOID VioStorBusyPollComplete(IN PVOID DeviceExtension, IN ULONG MessageID, IN UL
     {
         return;
     }
+
+    InterlockedIncrement(&adaptExt->dbgSubmitPollCalls);
 
     for (i = 0; i < spins; i++)
     {

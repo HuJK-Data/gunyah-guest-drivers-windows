@@ -339,6 +339,17 @@ typedef struct _ADAPTER_EXTENSION
     PVOID completionPollTimer;
     LONG pollArmed;
 
+    /* Diagnostic counters for the completion-path investigation: are completion
+     * MSI-X interrupts actually reaching the guest, or are completions only being
+     * reaped by the poll timer / inline busy-poll? Always compiled (the shipped
+     * build is Release, so #ifdef DBG counters would be absent). Dumped
+     * periodically via RhelDbgPrint(TRACE_LEVEL_FATAL). */
+    volatile LONG dbgIsrCalls;        /* ISR (MSI-X / INTx) invocations */
+    volatile LONG dbgCompletedTotal;  /* total requests reaped from used rings */
+    volatile LONG dbgCompletedIsr;    /* reaped in ISR context (bIsr == TRUE) */
+    volatile LONG dbgPollCalls;       /* completion-poll timer firings */
+    volatile LONG dbgSubmitPollCalls; /* inline submit-path busy-poll engagements */
+
 #ifdef DBG
     LONG srb_cnt;
     LONG inqueue_cnt;
