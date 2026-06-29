@@ -2893,7 +2893,7 @@ VOID VioStorCompleteRequest(IN PVOID DeviceExtension, IN ULONG MessageID, IN BOO
          * I/O, unlike the self-stopping poll timer). isr ~= completed => interrupts
          * are delivered; isr ~= 0 while completed grows => completions only reaped
          * by poll/busy-poll (interrupt suppressed or not waking the vCPU). */
-        if ((newTotal / 2000) != ((newTotal - (LONG)dbgReaped) / 2000))
+        if ((newTotal / 64) != ((newTotal - (LONG)dbgReaped) / 64))
         {
             /* Direct DbgPrint (not RhelDbgPrint, which is WPP in the Release
              * build and would need TMF/PDB to decode) so DebugView captures it
