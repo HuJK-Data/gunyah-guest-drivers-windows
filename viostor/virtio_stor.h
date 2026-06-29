@@ -280,6 +280,12 @@ typedef struct _ADAPTER_EXTENSION
     KTIMER pollTimer;          /* periodic ~1ms tick while draining */
     volatile LONG pollStop;    /* set to 1 to ask the thread to exit */
     volatile LONG pollOutstanding; /* >0 while requests are in flight */
+
+    /* DIAG (contention probe): who reaps + effective device queue depth. */
+    volatile LONG dbgIsrReaped;     /* completions reaped in ISR context */
+    volatile LONG dbgPollReaped;    /* completions reaped by the poll thread */
+    volatile LONG dbgPollDrains;    /* poll-thread drain cycles */
+    volatile LONG dbgMaxOutstanding;/* peak sum(srb_cnt) the poll thread observed */
 #ifdef DBG
     LONG srb_cnt;
     LONG inqueue_cnt;

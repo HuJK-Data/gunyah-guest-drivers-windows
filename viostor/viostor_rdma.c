@@ -482,6 +482,40 @@ static BOOLEAN VioStorAnyOutstanding(PADAPTER_EXTENSION adaptExt)
     return FALSE;
 }
 
+/* Sum of in-flight requests across queues = effective device queue depth. */
+static LONG VioStorSumOutstanding(PADAPTER_EXTENSION adaptExt)
+{
+    LONG sum = 0;
+    ULONG q;
+    for (q = 0; q < adaptExt->num_queues; q++)
+    {
+        sum += (LONG)adaptExt->processing_srbs[q].srb_cnt;
+    }
+    return sum;
+}
+
+VOID VioStorContentionLog(PVOID DeviceExtension)
+{
+    PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
+    STOR_LOG_EVENT_DETAILS logEvent;
+    ULONG dump[4];
+
+    dump[0] = (ULONG)adaptExt->dbgIsrReaped;
+    dump[1] = (ULONG)adaptExt->dbgPollReaped;
+    dump[2] = (ULONG)adaptExt->dbgPollDrains;
+    dump[3] = (ULONG)adaptExt->dbgMaxOutstanding;
+
+    RtlZeroMemory(&logEvent, sizeof(logEvent));
+    logEvent.InterfaceRevision = STOR_CURRENT_LOG_INTERFACE_REVISION;
+    logEvent.Size = sizeof(logEvent);
+    logEvent.EventAssociation = StorEventAdapterAssociation;
+    logEvent.StorportSpecificErrorCode = TRUE;
+    logEvent.ErrorCode = 0xD1A60002;
+    logEvent.DumpDataSize = sizeof(dump);
+    logEvent.DumpData = dump;
+    StorPortLogSystemEvent(DeviceExtension, &logEvent, NULL);
+}
+
 static VOID VioStorPollThreadRoutine(PVOID Context)
 {
     PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)Context;
@@ -509,6 +543,17 @@ static VOID VioStorPollThreadRoutine(PVOID Context)
              * PASSIVE_LEVEL with the queue lock released, letting submits and the
              * ISR make progress.
              */
+            LONG out = VioStorSumOutstanding(adaptExt); /* DIAG: effective device QD */
+            LONG drains;
+            if (out > adaptExt->dbgMaxOutstanding)
+            {
+                adaptExt->dbgMaxOutstanding = out;
+            }
+            drains = InterlockedIncrement(&adaptExt->dbgPollDrains);
+            if ((drains % 50000) == 0)
+            {
+                VioStorContentionLog(adaptExt);
+            }
             for (q = 0; q < adaptExt->num_queues; q++)
             {
                 VioStorCompleteRequest(adaptExt, q + adaptExt->msix_has_config_vector, FALSE);

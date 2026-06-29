@@ -125,4 +125,8 @@ VOID VioStorStopPollThread(PVOID DeviceExtension);
 /* Wake the poll thread after submitting work (any IRQL). */
 VOID VioStorPollKick(PVOID DeviceExtension);
 
+/* DIAG: emit the contention counters (isr/poll reaped, drains, max outstanding)
+ * to the System event log; read via Get-WinEvent (ErrorCode tag 0xD1A60002). */
+VOID VioStorContentionLog(PVOID DeviceExtension);
+
 #endif /* _VIOSTOR_RDMA_H_ */

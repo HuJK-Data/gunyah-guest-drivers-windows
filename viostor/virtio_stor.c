@@ -2268,6 +2268,7 @@ VOID VioStorCompleteRequest(IN PVOID DeviceExtension, IN ULONG MessageID, IN BOO
     PSRB_EXTENSION srbExt = NULL;
     UCHAR srbStatus = SRB_STATUS_SUCCESS;
     PREQUEST_LIST element = NULL;
+    ULONG dbgReaped = 0; /* DIAG: completions reaped this call */
 
     RhelDbgPrint(TRACE_LEVEL_VERBOSE, " ---> MessageID 0x%x\n", MessageID);
 
@@ -2301,6 +2302,7 @@ VOID VioStorCompleteRequest(IN PVOID DeviceExtension, IN ULONG MessageID, IN BOO
         {
             PLIST_ENTRY le = NULL;
             BOOLEAN bFound = FALSE;
+            dbgReaped++;
 #ifdef DBG
             InterlockedDecrement((LONG volatile *)&adaptExt->inqueue_cnt);
 #endif
@@ -2405,6 +2407,18 @@ VOID VioStorCompleteRequest(IN PVOID DeviceExtension, IN ULONG MessageID, IN BOO
             }
         }
     } while (!virtqueue_enable_cb(vq));
+
+    if (dbgReaped)
+    {
+        if (bIsr)
+        {
+            InterlockedAdd(&adaptExt->dbgIsrReaped, (LONG)dbgReaped);
+        }
+        else
+        {
+            InterlockedAdd(&adaptExt->dbgPollReaped, (LONG)dbgReaped);
+        }
+    }
 
     VioStorVQUnlock(DeviceExtension, MessageID, &queueLock, bIsr);
 
