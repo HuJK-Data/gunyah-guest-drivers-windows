@@ -40,21 +40,8 @@
 #define SET_VA_PA()                                                                                                    \
     {                                                                                                                  \
         ULONG len;                                                                                                     \
-        if (adaptExt->indirect && adaptExt->rdmaPoolActive && srbExt->bounceCtl)                                       \
-        {                                                                                                              \
-            va = (PUCHAR)srbExt->bounceCtl + BOUNCE_CTL_INDIRECT_OFFSET;                                               \
-            pa = BounceVAtoPA(&adaptExt->bounce, va).QuadPart;                                                         \
-        }                                                                                                              \
-        else if (adaptExt->indirect)                                                                                   \
-        {                                                                                                              \
-            va = srbExt->desc;                                                                                         \
-            pa = StorPortGetPhysicalAddress(DeviceExtension, NULL, va, &len).QuadPart;                                 \
-        }                                                                                                              \
-        else                                                                                                           \
-        {                                                                                                              \
-            va = NULL;                                                                                                 \
-            pa = 0;                                                                                                    \
-        }                                                                                                              \
+        va = adaptExt->indirect ? srbExt->desc : NULL;                                                                 \
+        pa = va ? StorPortGetPhysicalAddress(DeviceExtension, NULL, va, &len).QuadPart : 0;                            \
     }
 
 static ULONG GetSrbQueueNumber(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
@@ -113,23 +100,6 @@ RhelDoFlush(PVOID DeviceExtension, PSRB_TYPE Srb, BOOLEAN resend, BOOLEAN bIsr)
     struct virtqueue *vq = NULL;
     PREQUEST_LIST element;
 
-    /* Allocate bounce control slot BEFORE SET_VA_PA so indirect desc uses bounce */
-    if (adaptExt->rdmaPoolActive && adaptExt->bounce.Initialized)
-    {
-        PVOID ctlSlot = BounceAllocCtl(&adaptExt->bounce);
-        if (!ctlSlot)
-        {
-            RhelDbgPrint(TRACE_LEVEL_ERROR, " Bounce: no control slots for flush\n");
-            if (!resend)
-            {
-                CompleteRequestWithStatus(DeviceExtension, Srb, SRB_STATUS_BUSY);
-            }
-            return FALSE;
-        }
-        srbExt->bounceCtl = ctlSlot;
-        srbExt->bounceDataPageCount = 0;
-    }
-
     SET_VA_PA();
 
     QueueNumber = resend ? srbExt->queue_number : GetSrbQueueNumber(DeviceExtension, Srb);
@@ -145,15 +115,16 @@ RhelDoFlush(PVOID DeviceExtension, PSRB_TYPE Srb, BOOLEAN resend, BOOLEAN bIsr)
     srbExt->out = 1;
     srbExt->in = 1;
 
-    if (srbExt->bounceCtl)
+    if (adaptExt->rdmaPoolActive)
     {
-        RtlCopyMemory((PUCHAR)srbExt->bounceCtl + BOUNCE_CTL_OUTHDR_OFFSET,
-                      &srbExt->vbr.out_hdr,
-                      sizeof(srbExt->vbr.out_hdr));
-
-        srbExt->sg[0].physAddr = BounceVAtoPA(&adaptExt->bounce, (PUCHAR)srbExt->bounceCtl + BOUNCE_CTL_OUTHDR_OFFSET);
+        PVOID ctl = VioStorBounceAllocCtl(DeviceExtension, srbExt);
+        if (ctl == NULL)
+        {
+            return FALSE;
+        }
+        srbExt->sg[0].physAddr = VioStorRdmaVAtoPA(DeviceExtension, (PUCHAR)ctl + BOUNCE_CTL_OUTHDR_OFFSET);
         srbExt->sg[0].length = sizeof(srbExt->vbr.out_hdr);
-        srbExt->sg[1].physAddr = BounceVAtoPA(&adaptExt->bounce, (PUCHAR)srbExt->bounceCtl + BOUNCE_CTL_STATUS_OFFSET);
+        srbExt->sg[1].physAddr = VioStorRdmaVAtoPA(DeviceExtension, (PUCHAR)ctl + BOUNCE_CTL_STATUS_OFFSET);
         srbExt->sg[1].length = sizeof(srbExt->vbr.status);
     }
     else
@@ -172,7 +143,6 @@ RhelDoFlush(PVOID DeviceExtension, PSRB_TYPE Srb, BOOLEAN resend, BOOLEAN bIsr)
         {
             VioStorVQUnlock(DeviceExtension, MessageId, &LockHandle, FALSE);
 
-            BOUNCE_CLEANUP_SRB(adaptExt, srbExt);
             SRB_SET_DATA_TRANSFER_LENGTH(Srb, 0);
             CompleteRequestWithStatus(DeviceExtension, Srb, SRB_STATUS_BUS_RESET);
             return TRUE;
@@ -194,7 +164,6 @@ RhelDoFlush(PVOID DeviceExtension, PSRB_TYPE Srb, BOOLEAN resend, BOOLEAN bIsr)
     {
         if (adaptExt->reset_in_progress_count)
         {
-            BOUNCE_CLEANUP_SRB(adaptExt, srbExt);
             SRB_SET_DATA_TRANSFER_LENGTH(Srb, 0);
             CompleteRequestWithStatus(DeviceExtension, Srb, SRB_STATUS_BUS_RESET);
             return TRUE;
@@ -224,7 +193,6 @@ RhelDoFlush(PVOID DeviceExtension, PSRB_TYPE Srb, BOOLEAN resend, BOOLEAN bIsr)
         {
             VioStorVQUnlock(DeviceExtension, MessageId, &LockHandle, FALSE);
         }
-        BOUNCE_CLEANUP_SRB(adaptExt, srbExt);
         RhelDbgPrint(TRACE_LEVEL_ERROR, " Can not add packet to queue %d.\n", QueueNumber);
         StorPortBusy(DeviceExtension, 2);
     }
@@ -268,7 +236,6 @@ RhelDoReadWrite(PVOID DeviceExtension, PSRB_TYPE Srb)
     {
         VioStorVQUnlock(DeviceExtension, MessageId, &LockHandle, FALSE);
 
-        BOUNCE_CLEANUP_SRB(adaptExt, srbExt);
         SRB_SET_DATA_TRANSFER_LENGTH(Srb, 0);
         CompleteRequestWithStatus(DeviceExtension, Srb, SRB_STATUS_BUS_RESET);
         return TRUE;
@@ -301,13 +268,18 @@ RhelDoReadWrite(PVOID DeviceExtension, PSRB_TYPE Srb)
     else
     {
         VioStorVQUnlock(DeviceExtension, MessageId, &LockHandle, FALSE);
-        BOUNCE_CLEANUP_SRB(adaptExt, srbExt);
         RhelDbgPrint(TRACE_LEVEL_ERROR, " Can not add packet to queue %d.\n", QueueNumber);
         StorPortBusy(DeviceExtension, 2);
     }
     if (notify)
     {
         virtqueue_notify(vq);
+    }
+
+    /* Wake the completion poll thread (restricted DMA pool path). */
+    if (adaptExt->rdmaPoolActive)
+    {
+        VioStorPollKick(DeviceExtension);
     }
 
     if (adaptExt->num_queues > 1)
@@ -348,6 +320,8 @@ RhelDoUnMap(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
     BOOLEAN notify = FALSE;
     STOR_LOCK_HANDLE LockHandle = {0};
     struct virtqueue *vq = NULL;
+
+    SET_VA_PA();
 
     unmapList = (PUNMAP_LIST_HEADER)srbDataBuffer;
     if (!(CHECKBIT(adaptExt->features, VIRTIO_BLK_F_DISCARD)) || (unmapList == NULL) ||
@@ -404,47 +378,12 @@ RhelDoUnMap(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
     srbExt->out = 2;
     srbExt->in = 1;
 
-    /* Allocate bounce control slot BEFORE SET_VA_PA so indirect desc uses bounce */
-    if (adaptExt->rdmaPoolActive && adaptExt->bounce.Initialized)
-    {
-        PVOID ctlSlot = BounceAllocCtl(&adaptExt->bounce);
-        if (!ctlSlot)
-        {
-            RhelDbgPrint(TRACE_LEVEL_ERROR, " Bounce: no control slots for unmap\n");
-            Srb->SrbStatus = SRB_STATUS_BUSY;
-            return FALSE;
-        }
-        srbExt->bounceCtl = ctlSlot;
-        srbExt->bounceDataPageCount = 0;
-    }
-
-    SET_VA_PA();
-
-    if (srbExt->bounceCtl)
-    {
-        RtlCopyMemory((PUCHAR)srbExt->bounceCtl + BOUNCE_CTL_OUTHDR_OFFSET,
-                      &srbExt->vbr.out_hdr,
-                      sizeof(srbExt->vbr.out_hdr));
-        RtlCopyMemory((PUCHAR)srbExt->bounceCtl + BOUNCE_CTL_DISCARD_OFFSET,
-                      srbExt->blk_discard,
-                      sizeof(blk_discard_write_zeroes) * BlockDescrCount);
-
-        srbExt->sg[0].physAddr = BounceVAtoPA(&adaptExt->bounce, (PUCHAR)srbExt->bounceCtl + BOUNCE_CTL_OUTHDR_OFFSET);
-        srbExt->sg[0].length = sizeof(srbExt->vbr.out_hdr);
-        srbExt->sg[1].physAddr = BounceVAtoPA(&adaptExt->bounce, (PUCHAR)srbExt->bounceCtl + BOUNCE_CTL_DISCARD_OFFSET);
-        srbExt->sg[1].length = sizeof(blk_discard_write_zeroes) * BlockDescrCount;
-        srbExt->sg[2].physAddr = BounceVAtoPA(&adaptExt->bounce, (PUCHAR)srbExt->bounceCtl + BOUNCE_CTL_STATUS_OFFSET);
-        srbExt->sg[2].length = sizeof(srbExt->vbr.status);
-    }
-    else
-    {
-        srbExt->sg[0].physAddr = StorPortGetPhysicalAddress(DeviceExtension, NULL, &srbExt->vbr.out_hdr, &fragLen);
-        srbExt->sg[0].length = sizeof(srbExt->vbr.out_hdr);
-        srbExt->sg[1].physAddr = MmGetPhysicalAddress(&srbExt->blk_discard[0]);
-        srbExt->sg[1].length = sizeof(blk_discard_write_zeroes) * BlockDescrCount;
-        srbExt->sg[2].physAddr = StorPortGetPhysicalAddress(DeviceExtension, NULL, &srbExt->vbr.status, &fragLen);
-        srbExt->sg[2].length = sizeof(srbExt->vbr.status);
-    }
+    srbExt->sg[0].physAddr = StorPortGetPhysicalAddress(DeviceExtension, NULL, &srbExt->vbr.out_hdr, &fragLen);
+    srbExt->sg[0].length = sizeof(srbExt->vbr.out_hdr);
+    srbExt->sg[1].physAddr = MmGetPhysicalAddress(&srbExt->blk_discard[0]);
+    srbExt->sg[1].length = sizeof(blk_discard_write_zeroes) * BlockDescrCount;
+    srbExt->sg[2].physAddr = StorPortGetPhysicalAddress(DeviceExtension, NULL, &srbExt->vbr.status, &fragLen);
+    srbExt->sg[2].length = sizeof(srbExt->vbr.status);
 
     QueueNumber = GetSrbQueueNumber(DeviceExtension, Srb);
     MessageId = QueueToMessageId(DeviceExtension, QueueNumber);
@@ -463,7 +402,6 @@ RhelDoUnMap(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
     {
         VioStorVQUnlock(DeviceExtension, MessageId, &LockHandle, FALSE);
 
-        BOUNCE_CLEANUP_SRB(adaptExt, srbExt);
         SRB_SET_DATA_TRANSFER_LENGTH(Srb, 0);
         CompleteRequestWithStatus(DeviceExtension, Srb, SRB_STATUS_BUS_RESET);
         return TRUE;
@@ -496,7 +434,6 @@ RhelDoUnMap(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
     else
     {
         VioStorVQUnlock(DeviceExtension, MessageId, &LockHandle, FALSE);
-        BOUNCE_CLEANUP_SRB(adaptExt, srbExt);
         RhelDbgPrint(TRACE_LEVEL_ERROR, " Can not add packet to queue %d.\n", QueueNumber);
         StorPortBusy(DeviceExtension, 2);
     }
@@ -525,6 +462,8 @@ RhelGetSerialNumber(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
     ULONG fragLen = 0UL;
     PREQUEST_LIST element;
 
+    SET_VA_PA();
+
     RhelDbgPrint(TRACE_LEVEL_INFORMATION, " srbExt %p.\n", srbExt);
 
     QueueNumber = GetSrbQueueNumber(DeviceExtension, Srb);
@@ -540,34 +479,20 @@ RhelGetSerialNumber(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
     srbExt->out = 1;
     srbExt->in = 2;
 
-    /* Allocate bounce control slot BEFORE SET_VA_PA so indirect desc uses bounce */
-    if (adaptExt->rdmaPoolActive && adaptExt->bounce.Initialized)
+    if (adaptExt->rdmaPoolActive)
     {
-        PVOID ctlSlot = BounceAllocCtl(&adaptExt->bounce);
-        if (!ctlSlot)
+        PVOID ctl = VioStorBounceAllocCtl(DeviceExtension, srbExt);
+        if (ctl == NULL)
         {
-            RhelDbgPrint(TRACE_LEVEL_ERROR, " Bounce: no control slots for get_id\n");
-            SRB_SET_DATA_TRANSFER_LENGTH(Srb, 0);
-            CompleteRequestWithStatus(DeviceExtension, Srb, SRB_STATUS_BUSY);
-            return TRUE;
+            return FALSE;
         }
-        srbExt->bounceCtl = ctlSlot;
-        srbExt->bounceDataPageCount = 0;
-    }
-
-    SET_VA_PA();
-
-    if (srbExt->bounceCtl)
-    {
-        RtlCopyMemory((PUCHAR)srbExt->bounceCtl + BOUNCE_CTL_OUTHDR_OFFSET,
-                      &srbExt->vbr.out_hdr,
-                      sizeof(srbExt->vbr.out_hdr));
-
-        srbExt->sg[0].physAddr = BounceVAtoPA(&adaptExt->bounce, (PUCHAR)srbExt->bounceCtl + BOUNCE_CTL_OUTHDR_OFFSET);
+        /* Device writes the serial into the bounce slot; VioStorBounceComplete
+         * copies it back into adaptExt->sn. */
+        srbExt->sg[0].physAddr = VioStorRdmaVAtoPA(DeviceExtension, (PUCHAR)ctl + BOUNCE_CTL_OUTHDR_OFFSET);
         srbExt->sg[0].length = sizeof(srbExt->vbr.out_hdr);
-        srbExt->sg[1].physAddr = BounceVAtoPA(&adaptExt->bounce, (PUCHAR)srbExt->bounceCtl + BOUNCE_CTL_SN_OFFSET);
+        srbExt->sg[1].physAddr = VioStorRdmaVAtoPA(DeviceExtension, (PUCHAR)ctl + BOUNCE_CTL_SN_OFFSET);
         srbExt->sg[1].length = sizeof(adaptExt->sn);
-        srbExt->sg[2].physAddr = BounceVAtoPA(&adaptExt->bounce, (PUCHAR)srbExt->bounceCtl + BOUNCE_CTL_STATUS_OFFSET);
+        srbExt->sg[2].physAddr = VioStorRdmaVAtoPA(DeviceExtension, (PUCHAR)ctl + BOUNCE_CTL_STATUS_OFFSET);
         srbExt->sg[2].length = sizeof(srbExt->vbr.status);
     }
     else
@@ -586,7 +511,6 @@ RhelGetSerialNumber(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
     {
         VioStorVQUnlock(DeviceExtension, MessageId, &LockHandle, FALSE);
 
-        BOUNCE_CLEANUP_SRB(adaptExt, srbExt);
         SRB_SET_DATA_TRANSFER_LENGTH(Srb, 0);
         CompleteRequestWithStatus(DeviceExtension, Srb, SRB_STATUS_BUS_RESET);
         return TRUE;
@@ -619,7 +543,6 @@ RhelGetSerialNumber(IN PVOID DeviceExtension, IN PSRB_TYPE Srb)
     else
     {
         VioStorVQUnlock(DeviceExtension, MessageId, &LockHandle, FALSE);
-        BOUNCE_CLEANUP_SRB(adaptExt, srbExt);
         RhelDbgPrint(TRACE_LEVEL_ERROR, " Can not add packet to queue %d.\n", QueueNumber);
         StorPortBusy(DeviceExtension, 2);
     }
@@ -635,6 +558,10 @@ VOID RhelShutDown(IN PVOID DeviceExtension)
 {
     ULONG index;
     PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
+
+    /* Stop the completion poll thread before tearing the queues down so it can
+     * no longer touch them (restricted DMA pool path). */
+    VioStorStopPollThread(DeviceExtension);
 
     virtio_device_reset(&adaptExt->vdev);
     virtio_delete_queues(&adaptExt->vdev);
@@ -750,6 +677,16 @@ VOID RhelGetDiskGeometry(IN PVOID DeviceExtension)
 
     PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
     adaptExt->features = virtio_get_features(&adaptExt->vdev);
+
+    /*
+     * Restricted DMA pool: DISCARD is not bounced (its blk_discard range array
+     * would otherwise sit in non-device-visible guest memory). Drop the feature
+     * so it is neither advertised to the OS nor used, avoiding a corrupt discard.
+     */
+    if (adaptExt->rdmaPoolActive)
+    {
+        adaptExt->features &= ~(1ULL << VIRTIO_BLK_F_DISCARD);
+    }
 
     if (CHECKBIT(adaptExt->features, VIRTIO_BLK_F_BARRIER))
     {
