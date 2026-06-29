@@ -141,7 +141,7 @@ typedef struct VirtIOBufferDescriptor VIO_SG, *PVIO_SG;
  * the idle-vCPU stall only meaningfully caps throughput for big per-I/O payloads
  * (the classic sequential pattern), which is exactly where we want to spin.
  */
-#define VIOSTOR_BUSYPOLL_ENABLE            1
+#define VIOSTOR_BUSYPOLL_ENABLE            0
 /* Only busy-poll when at most this many requests are outstanding on the queue
  * (counts the just-submitted request, including each split child). */
 #define VIOSTOR_BUSYPOLL_MAX_INFLIGHT      4
