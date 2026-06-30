@@ -92,25 +92,11 @@ HKR,,TypesSupported,%REG_DWORD%,7
 HKR, "Parameters\PnpInterface", "5", %REG_DWORD%, 0x00000001
 HKR, "Parameters", "BusType", %REG_DWORD%, 0x00000001
 HKR, "Parameters", DmaRemappingCompatible,0x00010001,0
-; Completion reaping (restricted-DMA-pool / Gunyah path).
-;  DisableCompletionPoll: 0 = run the completion poll thread (default); 1 = interrupt-only
-;    (ISR/DPC, paired with MSISupported=0).
-;  PollIntervalUs: while I/O is outstanding the poll thread sleeps this many microseconds
-;    between drains. Default 1000 (1ms) = gentle poll: reaps within ~1ms (no 250ms
-;    watchdog stall) at low CPU. Set 0 for a tight busy-spin (max IOPS, pegs a core).
-; Read via StorPortRegistryRead(Global=1) from Services\viostor\Parameters.
-HKR, "Parameters", DisableCompletionPoll, 0x00010001, 0
-HKR, "Parameters", PollIntervalUs, 0x00010001, 1000
 
 [pnpsafe_pci_addreg_msix]
 HKR, "Interrupt Management",, 0x00000010
 HKR, "Interrupt Management\MessageSignaledInterruptProperties",, 0x00000010
-; MSI-X is not implemented by the crosvm/Gunyah platform this driver targets. With
-; MSISupported=1 the PCI MSI-X capability the device advertises makes Windows wire
-; the message ISR (HwMSInterruptRoutine) and never the line ISR, so the INTx the
-; device actually asserts is dropped. Force line-based INTx so VirtIoInterrupt is
-; connected. (Linux already falls back to INTx in-driver; Windows/StorPort does not.)
-HKR, "Interrupt Management\MessageSignaledInterruptProperties", MSISupported, 0x00010001, 0
+HKR, "Interrupt Management\MessageSignaledInterruptProperties", MSISupported, 0x00010001, 1
 HKR, "Interrupt Management\MessageSignaledInterruptProperties", MessageNumberLimit, 0x00010001, 257
 HKR, "Interrupt Management\Affinity Policy",, 0x00000010
 HKR, "Interrupt Management\Affinity Policy", DevicePolicy, 0x00010001, 5
