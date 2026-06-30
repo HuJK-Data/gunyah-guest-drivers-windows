@@ -600,15 +600,17 @@ VirtIoPassiveInitializeRoutine(IN PVOID DeviceExtension)
             return FALSE;
         }
         /* The bounce allocator above is required on the rdmapool path regardless of
-         * how completions are reaped. The poll thread is separable: with a working
-         * INTx/ISR it is redundant, and its busy-spin pegs a host pCPU. Allow turning
-         * it off via registry to run interrupt-only (and to A/B test the ISR path).
-         * Default 0 = poll on, preserving current behavior. */
+         * how completions are reaped. The poll thread is separable, and DEFAULT OFF:
+         * with INTx wired (MSISupported=0) completions arrive via the ISR/DPC, so the
+         * busy-spin is redundant and only pegs a host pCPU. Run interrupt-only by
+         * default; the registry value DisableCompletionPoll (Services\viostor\
+         * Parameters) can override -- set it to 0 to bring the busy-poll thread back
+         * as a fallback if the interrupt path proves insufficient. */
+        adaptExt->disablePoll = 1;
         VioStorReadRegistryDword(DeviceExtension, (PUCHAR) "DisableCompletionPoll", &adaptExt->disablePoll);
         if (adaptExt->disablePoll)
         {
-            RhelDbgPrint(TRACE_LEVEL_FATAL,
-                         " completion poll thread DISABLED via registry (interrupt-only mode)\n");
+            RhelDbgPrint(TRACE_LEVEL_FATAL, " completion poll thread OFF (interrupt-only mode)\n");
         }
         else if (!NT_SUCCESS(VioStorStartPollThread(DeviceExtension)))
         {
