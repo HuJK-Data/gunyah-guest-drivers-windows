@@ -32,23 +32,6 @@
 /* Indirect descriptor table starts at page 1 */
 #define BOUNCE_CTL_INDIRECT_OFFSET PAGE_SIZE
 
-/*
- * Data bounce region is carved into fixed-size CONTIGUOUS chunks rather than
- * single 4KB pages. Each chunk is physically contiguous, so a chunk maps to a
- * single virtqueue descriptor (provided chunk size <= device size_max). This
- * collapses a large transfer from one-descriptor-per-page (e.g. 256 for 1MB)
- * down to ceil(transfer / chunk) descriptors (e.g. 6 for 1MB @ 192KB chunks),
- * which is the dominant cost for the device/hypervisor in a protected VM.
- * Keep chunks below 256KB so 1MB requests do not form a 4 x 256KB descriptor
- * pattern, which is watchdog-paced on the DroidVM restricted-DMA storage path.
- *
- * The chunk size is clamped down to the device's size_max, and further reduced
- * if needed so the pool yields at least CtlSlotCount (queue_depth) chunks (see
- * BounceInit) — so large transfers stay cheap without starving small-I/O
- * concurrency.
- */
-#define BOUNCE_DATA_CHUNK_SIZE     (192 * 1024)
-
 typedef struct _BOUNCE_ALLOCATOR
 {
     PUCHAR BaseVA;
@@ -60,11 +43,9 @@ typedef struct _BOUNCE_ALLOCATOR
     ULONG CtlSlotCount;
     PUCHAR CtlBaseVA;
 
-    /* Data chunk free list (lock-free SLIST). Each entry is one contiguous
-     * DataChunkSize-byte chunk. */
+    /* Data page free list (lock-free SLIST) */
     DECLSPEC_ALIGN(MEMORY_ALLOCATION_ALIGNMENT) SLIST_HEADER DataFreeList;
-    ULONG DataChunkSize;  /* bytes per chunk (page-aligned, <= device size_max) */
-    ULONG DataChunkCount; /* number of chunks carved from the data region */
+    ULONG DataPageCount;
     PUCHAR DataBaseVA;
 
     BOOLEAN Initialized;
@@ -75,15 +56,9 @@ typedef struct _BOUNCE_ALLOCATOR
  * baseVA/basePA: start of available rdmapool region (after ring buffers).
  * totalSize: bytes available.
  * ctlSlotCount: number of control slots to pre-allocate (typically queue_depth).
- * dataChunkSize: requested bytes per data chunk (clamped to PAGE_SIZE..region).
  */
 NTSTATUS
-BounceInit(PBOUNCE_ALLOCATOR Alloc,
-           PUCHAR BaseVA,
-           PHYSICAL_ADDRESS BasePA,
-           SIZE_T TotalSize,
-           ULONG CtlSlotCount,
-           ULONG DataChunkSize);
+BounceInit(PBOUNCE_ALLOCATOR Alloc, PUCHAR BaseVA, PHYSICAL_ADDRESS BasePA, SIZE_T TotalSize, ULONG CtlSlotCount);
 
 /* Allocate a control slot. Returns VA or NULL if exhausted. */
 PVOID BounceAllocCtl(PBOUNCE_ALLOCATOR Alloc);
@@ -91,11 +66,11 @@ PVOID BounceAllocCtl(PBOUNCE_ALLOCATOR Alloc);
 /* Free a control slot back to the pool. */
 VOID BounceFreeCtl(PBOUNCE_ALLOCATOR Alloc, PVOID CtlVA);
 
-/* Allocate one contiguous data chunk (DataChunkSize bytes). NULL if exhausted. */
-PVOID BounceAllocDataChunk(PBOUNCE_ALLOCATOR Alloc);
+/* Allocate a single data page. Returns VA or NULL if exhausted. */
+PVOID BounceAllocDataPage(PBOUNCE_ALLOCATOR Alloc);
 
-/* Free a data chunk back to the pool. */
-VOID BounceFreeDataChunk(PBOUNCE_ALLOCATOR Alloc, PVOID ChunkVA);
+/* Free a single data page back to the pool. */
+VOID BounceFreeDataPage(PBOUNCE_ALLOCATOR Alloc, PVOID PageVA);
 
 /* Convert a bounce VA to its physical address. */
 FORCEINLINE
@@ -118,8 +93,7 @@ BouncePAtoVA(PBOUNCE_ALLOCATOR Alloc, PHYSICAL_ADDRESS PA)
 /*
  * Cleanup macro: free all bounce resources for an SRB.
  * Safe to call even when bounceCtl is NULL (no-op).
- * Each data chunk occupies one sg[] entry (sg[1..bounceDataChunkCount]); the
- * entry's physAddr is the chunk base, so we recover the chunk VA from it.
+ * Uses VIO_SG sg[] entries to find data page PAs.
  */
 #define BOUNCE_CLEANUP_SRB(pAdaptExt, pSrbExt)                                                                         \
     do                                                                                                                 \
@@ -127,31 +101,14 @@ BouncePAtoVA(PBOUNCE_ALLOCATOR Alloc, PHYSICAL_ADDRESS PA)
         if ((pSrbExt)->bounceCtl)                                                                                      \
         {                                                                                                              \
             ULONG _bci;                                                                                                \
-            for (_bci = 1; _bci <= (pSrbExt)->bounceDataChunkCount; _bci++)                                            \
+            for (_bci = 1; _bci <= (pSrbExt)->bounceDataPageCount; _bci++)                                             \
             {                                                                                                          \
-                BounceFreeDataChunk(&(pAdaptExt)->bounce,                                                              \
-                                    BouncePAtoVA(&(pAdaptExt)->bounce, (pSrbExt)->sg[_bci].physAddr));                 \
+                BounceFreeDataPage(&(pAdaptExt)->bounce,                                                               \
+                                   BouncePAtoVA(&(pAdaptExt)->bounce, (pSrbExt)->sg[_bci].physAddr));                  \
             }                                                                                                          \
             BounceFreeCtl(&(pAdaptExt)->bounce, (pSrbExt)->bounceCtl);                                                 \
             (pSrbExt)->bounceCtl = NULL;                                                                               \
-            (pSrbExt)->bounceDataChunkCount = 0;                                                                       \
-        }                                                                                                              \
-    } while (0)
-
-#define BOUNCE_CLEANUP_SPLIT_CHILD(pAdaptExt, pChild)                                                                  \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        if ((pChild)->bounceCtl)                                                                                       \
-        {                                                                                                              \
-            ULONG _bci;                                                                                                \
-            for (_bci = 1; _bci <= (pChild)->bounceDataChunkCount; _bci++)                                             \
-            {                                                                                                          \
-                BounceFreeDataChunk(&(pAdaptExt)->bounce,                                                              \
-                                    BouncePAtoVA(&(pAdaptExt)->bounce, (pChild)->sg[_bci].physAddr));                  \
-            }                                                                                                          \
-            BounceFreeCtl(&(pAdaptExt)->bounce, (pChild)->bounceCtl);                                                  \
-            (pChild)->bounceCtl = NULL;                                                                                \
-            (pChild)->bounceDataChunkCount = 0;                                                                        \
+            (pSrbExt)->bounceDataPageCount = 0;                                                                        \
         }                                                                                                              \
     } while (0)
 

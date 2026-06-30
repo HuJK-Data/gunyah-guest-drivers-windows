@@ -378,10 +378,9 @@ static NTSTATUS VioStorRdmaPoolIoctl(PADAPTER_EXTENSION adaptExt,
  * rdmapool is a boot-start ACPI driver that loads before PCI enumeration,
  * so it is available by the time viostor's VirtIoFindAdapter runs.
  *
- * Uses QUERY_POOL to size the requested private region, then allocates that
- * region through rdmapool's bitmap allocator. viostor still sub-allocates from
- * the returned contiguous block, but the block itself is owned by viostor and
- * cannot overlap other rdmapool clients such as NetKVM.
+ * Uses QUERY_POOL to get pool base, redirects the bump allocator to pool memory,
+ * then sends RESERVE to mark pages in the bitmap so other clients (e.g., vioinput)
+ * won't allocate overlapping regions.
  */
 NTSTATUS VioStorConnectRdmaPool(PADAPTER_EXTENSION adaptExt)
 {
@@ -389,12 +388,10 @@ NTSTATUS VioStorConnectRdmaPool(PADAPTER_EXTENSION adaptExt)
     PWSTR deviceInterfaceList = NULL;
     UNICODE_STRING deviceName;
     RDMAPOOL_QUERY_POOL_OUTPUT queryOutput;
-    RDMAPOOL_ALLOCATE_INPUT allocInput;
-    RDMAPOOL_ALLOCATE_OUTPUT allocOutput;
+    RDMAPOOL_RESERVE_INPUT reserveInput;
     ULONG ringPages;
     ULONG bouncePages;
     ULONG totalPages;
-    ULONG poolPages;
 
     adaptExt->rdmaPoolActive = FALSE;
 
@@ -444,7 +441,6 @@ NTSTATUS VioStorConnectRdmaPool(PADAPTER_EXTENSION adaptExt)
     adaptExt->rdmaPoolBaseVA = queryOutput.BaseVirtualAddress;
     adaptExt->rdmaPoolBasePA = queryOutput.BasePhysicalAddress;
     adaptExt->rdmaPoolSize = queryOutput.TotalSize;
-    poolPages = (ULONG)(queryOutput.TotalSize / PAGE_SIZE);
 
     /* Calculate pages needed:
      * Ring buffers: pageAllocationSize (already computed by caller).
@@ -452,41 +448,31 @@ NTSTATUS VioStorConnectRdmaPool(PADAPTER_EXTENSION adaptExt)
      * Use half the pool for bounce data, capped at 8192 pages (32MB). */
     ringPages = adaptExt->pageAllocationSize / PAGE_SIZE;
     bouncePages = adaptExt->queue_depth * BOUNCE_CTL_PAGES;
-    bouncePages += min(8192, poolPages / 2);
+    bouncePages += min(8192, (ULONG)(queryOutput.TotalSize / PAGE_SIZE) / 2);
     totalPages = ringPages + bouncePages;
 
-    if (totalPages > poolPages)
+    if (totalPages > (ULONG)(queryOutput.TotalSize / PAGE_SIZE))
     {
-        totalPages = poolPages;
+        totalPages = (ULONG)(queryOutput.TotalSize / PAGE_SIZE);
     }
 
-    RtlZeroMemory(&allocInput, sizeof(allocInput));
-    RtlZeroMemory(&allocOutput, sizeof(allocOutput));
-    allocInput.NumPages = totalPages;
+    /* Reserve pages in rdmapool bitmap (prevents overlap with other clients).
+     * This is input-only, no output buffer needed. */
+    RtlZeroMemory(&reserveInput, sizeof(reserveInput));
+    reserveInput.NumPages = totalPages;
 
-    status = VioStorRdmaPoolIoctl(adaptExt,
-                                  IOCTL_RDMAPOOL_ALLOCATE,
-                                  &allocInput,
-                                  sizeof(allocInput),
-                                  &allocOutput,
-                                  sizeof(allocOutput));
+    status = VioStorRdmaPoolIoctl(adaptExt, IOCTL_RDMAPOOL_RESERVE, &reserveInput, sizeof(reserveInput), NULL, 0);
 
     if (!NT_SUCCESS(status))
     {
-        RhelDbgPrint(TRACE_LEVEL_ERROR,
-                     " rdmapool: IOCTL_RDMAPOOL_ALLOCATE failed 0x%x (pages=%u)\n",
+        RhelDbgPrint(TRACE_LEVEL_WARNING,
+                     " rdmapool: IOCTL_RDMAPOOL_RESERVE failed 0x%x (pages=%u), continuing\n",
                      status,
                      totalPages);
-        ObDereferenceObject(adaptExt->rdmaPoolFileObject);
-        adaptExt->rdmaPoolFileObject = NULL;
-        adaptExt->rdmaPoolDeviceObject = NULL;
-        return status;
+        /* Non-fatal: viostor still works, but overlap with vioinput is possible */
     }
 
     adaptExt->rdmaPoolActive = TRUE;
-    adaptExt->rdmaPoolBaseVA = allocOutput.VirtualAddress;
-    adaptExt->rdmaPoolBasePA = allocOutput.PhysicalAddress;
-    adaptExt->rdmaPoolSize = (ULONG64)totalPages * PAGE_SIZE;
 
     /* Redirect the bump allocator to use the restricted DMA pool */
     adaptExt->pageAllocationVa = adaptExt->rdmaPoolBaseVA;
@@ -494,7 +480,7 @@ NTSTATUS VioStorConnectRdmaPool(PADAPTER_EXTENSION adaptExt)
     adaptExt->pageOffset = 0;
 
     RhelDbgPrint(TRACE_LEVEL_INFORMATION,
-                 " rdmapool: Connected - VA=%p PA=0x%I64x Size=0x%I64x, allocated %u pages\n",
+                 " rdmapool: Connected - VA=%p PA=0x%I64x Size=0x%I64x, reserved %u pages\n",
                  adaptExt->rdmaPoolBaseVA,
                  adaptExt->rdmaPoolBasePA.QuadPart,
                  adaptExt->rdmaPoolSize,
@@ -505,22 +491,6 @@ NTSTATUS VioStorConnectRdmaPool(PADAPTER_EXTENSION adaptExt)
 
 VOID VioStorDisconnectRdmaPool(PADAPTER_EXTENSION adaptExt)
 {
-    if (adaptExt->rdmaPoolActive && adaptExt->rdmaPoolBaseVA != NULL && adaptExt->rdmaPoolFileObject != NULL)
-    {
-        RDMAPOOL_FREE_INPUT freeInput;
-        NTSTATUS status;
-
-        RtlZeroMemory(&freeInput, sizeof(freeInput));
-        freeInput.VirtualAddress = adaptExt->rdmaPoolBaseVA;
-        freeInput.NumPages = (ULONG)(adaptExt->rdmaPoolSize / PAGE_SIZE);
-
-        status = VioStorRdmaPoolIoctl(adaptExt, IOCTL_RDMAPOOL_FREE, &freeInput, sizeof(freeInput), NULL, 0);
-        if (!NT_SUCCESS(status))
-        {
-            RhelDbgPrint(TRACE_LEVEL_WARNING, " rdmapool: IOCTL_RDMAPOOL_FREE failed 0x%x\n", status);
-        }
-    }
-
     if (adaptExt->rdmaPoolFileObject != NULL)
     {
         ObDereferenceObject(adaptExt->rdmaPoolFileObject);
@@ -528,6 +498,5 @@ VOID VioStorDisconnectRdmaPool(PADAPTER_EXTENSION adaptExt)
     }
     adaptExt->rdmaPoolDeviceObject = NULL;
     adaptExt->rdmaPoolBaseVA = NULL;
-    adaptExt->rdmaPoolSize = 0;
     adaptExt->rdmaPoolActive = FALSE;
 }

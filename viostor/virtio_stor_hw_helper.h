@@ -152,10 +152,6 @@ VOID RhelGetDiskGeometry(IN PVOID DeviceExtension);
 
 VOID VioStorCompleteRequest(IN PVOID DeviceExtension, IN ULONG MessageID, IN BOOLEAN bIsr);
 
-/* Arm the completion-poll fallback timer if not already armed. Called from the
- * submit paths so a missed completion IRQ is reaped within VIOSTOR_POLL_INTERVAL_US. */
-VOID VioStorArmCompletionPoll(IN PVOID DeviceExtension);
-
 PVOID
 VioStorPoolAlloc(IN PVOID DeviceExtension, IN SIZE_T size);
 
