@@ -62,6 +62,7 @@
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ImportGroup Label="ExtensionSettings">
+    <Import Project="$(VCTargetsPath)\BuildCustomizations\marmasm.props" Condition="'$(Platform)'=='ARM64'" />
   </ImportGroup>
   <ImportGroup Label="PropertySheets">
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
@@ -108,6 +109,9 @@
     <ClCompile Include="dmapool.c" />
   </ItemGroup>
   <ItemGroup>
+    <MARMASM Include="rdmapool_psci.asm" Condition="'$(Platform)'=='ARM64'" />
+  </ItemGroup>
+  <ItemGroup>
     <ClInclude Include="rdmapool.h" />
     <ClInclude Include="rdmapool_interface.h" />
     <ClInclude Include="dmapool.h" />
@@ -117,5 +121,6 @@
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
+    <Import Project="$(VCTargetsPath)\BuildCustomizations\marmasm.targets" Condition="'$(Platform)'=='ARM64'" />
   </ImportGroup>
 </Project>

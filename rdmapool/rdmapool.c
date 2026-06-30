@@ -39,6 +39,42 @@ DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath)
     return status;
 }
 
+/* PSCI SYSTEM_OFF via HVC (defined in rdmapool_psci.asm). Conduit on this platform
+ * is "hvc"; Gunyah turns this into GH_RM_EXIT_TYPE_PSCI_POWER_OFF and powers the VM
+ * off (the same path Linux/edk2 use). */
+extern unsigned long long PsciHvcCall(unsigned long long Fn,
+                                      unsigned long long Arg1,
+                                      unsigned long long Arg2,
+                                      unsigned long long Arg3);
+#define PSCI_SYSTEM_OFF 0x84000008ULL
+
+/*
+ * Last-chance shutdown handler.
+ *
+ * Windows ARM64 powers off via the ACPI sleep register, which nothing on the
+ * Gunyah host catches, so the VM hangs at the very end of shutdown (manual
+ * power-off needed). Issue PSCI SYSTEM_OFF here — the platform already handles it
+ * (Linux shuts down this way) — so the VM powers off cleanly.
+ *
+ * KMDF does not surface IRP_MJ_SHUTDOWN, so this is wired as a WDM IRP preprocess
+ * callback on our device object, which is registered for last-chance shutdown
+ * notification in RdmaPoolEvtDeviceAdd.
+ */
+NTSTATUS
+RdmaPoolShutdownIrp(_In_ WDFDEVICE Device, _Inout_ PIRP Irp)
+{
+    UNREFERENCED_PARAMETER(Device);
+
+    DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_INFO_LEVEL, "rdmapool: last-chance shutdown -> PSCI SYSTEM_OFF\n");
+    (void)PsciHvcCall(PSCI_SYSTEM_OFF, 0, 0, 0);
+
+    /* Should not return (VM powered off). Complete the IRP defensively. */
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+    Irp->IoStatus.Information = 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
+}
+
 NTSTATUS
 RdmaPoolEvtDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT DeviceInit)
 {
@@ -59,6 +95,18 @@ RdmaPoolEvtDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT DeviceInit)
     pnpPowerCallbacks.EvtDeviceReleaseHardware = RdmaPoolEvtDeviceReleaseHardware;
     WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &pnpPowerCallbacks);
 
+    /* Route IRP_MJ_SHUTDOWN (which KMDF does not surface) to our preprocess
+     * callback so we can PSCI-power-off the VM at last-chance shutdown. */
+    status = WdfDeviceInitAssignWdmIrpPreprocessCallback(DeviceInit, RdmaPoolShutdownIrp, IRP_MJ_SHUTDOWN, NULL, 0);
+    if (!NT_SUCCESS(status))
+    {
+        DbgPrintEx(DPFLTR_DEFAULT_ID,
+                   DPFLTR_ERROR_LEVEL,
+                   "rdmapool: assign IRP_MJ_SHUTDOWN preprocess failed 0x%x\n",
+                   status);
+        return status;
+    }
+
     /* Create the device */
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&deviceAttributes, RDMAPOOL_DEVICE_CONTEXT);
     status = WdfDeviceCreate(&DeviceInit, &deviceAttributes, &device);
@@ -66,6 +114,18 @@ RdmaPoolEvtDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT DeviceInit)
     {
         DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL, "rdmapool: WdfDeviceCreate failed 0x%x\n", status);
         return status;
+    }
+
+    /* Register for last-chance shutdown so RdmaPoolShutdownIrp runs at the very
+     * end of system shutdown and powers the VM off via PSCI. */
+    status = IoRegisterLastChanceShutdownNotification(WdfDeviceWdmGetDeviceObject(device));
+    if (!NT_SUCCESS(status))
+    {
+        DbgPrintEx(DPFLTR_DEFAULT_ID,
+                   DPFLTR_WARNING_LEVEL,
+                   "rdmapool: IoRegisterLastChanceShutdownNotification failed 0x%x\n",
+                   status);
+        /* Non-fatal: the pool still works; only clean power-off is lost. */
     }
 
     /* Create device interface so clients can discover us */
