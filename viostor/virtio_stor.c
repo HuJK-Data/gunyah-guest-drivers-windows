@@ -558,6 +558,24 @@ VirtIoFindAdapter(IN PVOID DeviceExtension,
     return SP_RETURN_FOUND;
 }
 
+/* Read a REG_DWORD from Services\viostor\Parameters (StorPortRegistryRead Global=1).
+ * Leaves *pValue untouched if the value is absent, so the caller's default holds. */
+static VOID VioStorReadRegistryDword(IN PVOID DeviceExtension, IN PUCHAR ValueName, IN OUT PULONG pValue)
+{
+    ULONG Len = sizeof(ULONG);
+    UCHAR *pBuf = StorPortAllocateRegistryBuffer(DeviceExtension, &Len);
+    if (pBuf == NULL)
+    {
+        return;
+    }
+    memset(pBuf, 0, sizeof(ULONG));
+    if (StorPortRegistryRead(DeviceExtension, ValueName, 1, MINIPORT_REG_DWORD, pBuf, &Len) && Len == sizeof(ULONG))
+    {
+        *pValue = *(ULONG *)pBuf;
+    }
+    StorPortFreeRegistryBuffer(DeviceExtension, pBuf);
+}
+
 BOOLEAN
 VirtIoPassiveInitializeRoutine(IN PVOID DeviceExtension)
 {
@@ -581,7 +599,18 @@ VirtIoPassiveInitializeRoutine(IN PVOID DeviceExtension)
             RhelDbgPrint(TRACE_LEVEL_FATAL, " bounce init failed\n");
             return FALSE;
         }
-        if (!NT_SUCCESS(VioStorStartPollThread(DeviceExtension)))
+        /* The bounce allocator above is required on the rdmapool path regardless of
+         * how completions are reaped. The poll thread is separable: with a working
+         * INTx/ISR it is redundant, and its busy-spin pegs a host pCPU. Allow turning
+         * it off via registry to run interrupt-only (and to A/B test the ISR path).
+         * Default 0 = poll on, preserving current behavior. */
+        VioStorReadRegistryDword(DeviceExtension, (PUCHAR) "DisableCompletionPoll", &adaptExt->disablePoll);
+        if (adaptExt->disablePoll)
+        {
+            RhelDbgPrint(TRACE_LEVEL_FATAL,
+                         " completion poll thread DISABLED via registry (interrupt-only mode)\n");
+        }
+        else if (!NT_SUCCESS(VioStorStartPollThread(DeviceExtension)))
         {
             RhelDbgPrint(TRACE_LEVEL_FATAL, " poll thread start failed\n");
             return FALSE;

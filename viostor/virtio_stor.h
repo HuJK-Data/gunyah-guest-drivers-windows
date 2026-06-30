@@ -278,6 +278,7 @@ typedef struct _ADAPTER_EXTENSION
     PVOID pollThread;       /* PKTHREAD referenced object */
     KEVENT pollWake;        /* signalled by submit path / kick */
     volatile LONG pollStop; /* set to 1 to ask the thread to exit */
+    ULONG disablePoll;      /* registry DisableCompletionPoll: 1 => ISR/DPC only */
 #ifdef DBG
     LONG srb_cnt;
     LONG inqueue_cnt;
